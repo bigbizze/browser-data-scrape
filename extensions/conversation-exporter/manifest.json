@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Conversation Exporter",
+  "version": "0.2.0",
+  "description": "Exports the active ChatGPT or Claude conversation to JSON.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "declarativeContent"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://claude.ai/*",
+    "https://app.claude.ai/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Export conversation",
+    "default_popup": "popup.html"
+  }
+}
