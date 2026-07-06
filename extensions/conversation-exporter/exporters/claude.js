@@ -1,3 +1,8 @@
+var CLAUDE_EXPORT_MODE_CURRENT = "current-branch";
+var CLAUDE_EXPORT_MODE_ALL = "all-branches";
+var CLAUDE_BRANCH_STRUCTURE = "segment-tree";
+var CLAUDE_ROOT_PARENT_UUID = "00000000-0000-4000-8000-000000000000";
+
 (async () => {
   if (window.__claudeConversationExportInProgress) {
     return {
@@ -6,14 +11,16 @@
     };
   }
 
+  const exportMode = normalizeClaudeExportMode(window.__claudeExportMode);
   window.__claudeConversationExportInProgress = true;
 
   try {
-    const out = await exportClaudeConversation();
+    const out = await exportClaudeConversation(exportMode);
     return {
       ok: true,
       source: out.source,
-      counts: out.counts,
+      exportMode: out.exportMode || exportMode,
+      counts: out.totalCounts || out.counts,
       conversationId: out.conversationId,
       downloadName: out.downloadName
     };
@@ -24,11 +31,16 @@
       error: error && error.message ? error.message : String(error)
     };
   } finally {
+    delete window.__claudeExportMode;
     window.__claudeConversationExportInProgress = false;
   }
 })();
 
-async function exportClaudeConversation() {
+function normalizeClaudeExportMode(mode) {
+  return mode === CLAUDE_EXPORT_MODE_ALL ? CLAUDE_EXPORT_MODE_ALL : CLAUDE_EXPORT_MODE_CURRENT;
+}
+
+async function exportClaudeConversation(exportMode) {
   const conversationId = getConversationId();
   if (!conversationId) {
     throw new Error("No Claude conversation id found in the URL.");
@@ -40,12 +52,23 @@ async function exportClaudeConversation() {
   for (const orgId of orgIds) {
     try {
       const data = await fetchClaudeConversation(orgId, conversationId);
-      const out = buildClaudeApiExport(data, conversationId, orgId);
-      return downloadAndReturn(out, `claude-export-${Date.now()}.json`);
+      const out = exportMode === CLAUDE_EXPORT_MODE_ALL
+        ? buildClaudeAllBranchesExport(data, conversationId, orgId)
+        : buildClaudeCurrentBranchExport(data, conversationId, orgId);
+      const downloadName = exportMode === CLAUDE_EXPORT_MODE_ALL
+        ? `claude-all-branches-export-${Date.now()}.json`
+        : `claude-export-${Date.now()}.json`;
+
+      return downloadAndReturn(out, downloadName);
     } catch (error) {
       apiError = error;
       console.warn(`[claude-export] API export failed for org ${orgId}`, error);
     }
+  }
+
+  if (exportMode === CLAUDE_EXPORT_MODE_ALL) {
+    const reason = apiError && apiError.message ? ` Last API error: ${apiError.message}` : "";
+    throw new Error(`Claude API all-branches export failed.${reason}`);
   }
 
   const fallback = buildClaudeDomFallbackExport(conversationId, apiError);
@@ -143,7 +166,7 @@ function addUniqueMany(list, values) {
 async function fetchClaudeConversation(orgId, conversationId) {
   const url = `${location.origin}/api/organizations/${encodeURIComponent(orgId)}`
     + `/chat_conversations/${encodeURIComponent(conversationId)}`
-    + "?tree=true&rendering_mode=messages&render_all_tools=true";
+    + "?tree=True&rendering_mode=messages&render_all_tools=true&consistency=strong";
 
   const response = await fetch(url, {
     credentials: "include",
@@ -164,56 +187,23 @@ async function fetchClaudeConversation(orgId, conversationId) {
   return data;
 }
 
-function buildClaudeApiExport(data, conversationId, orgId) {
+function buildClaudeCurrentBranchExport(data, conversationId, orgId) {
   const thread = getActiveClaudeThread(data);
-  const messages = [];
-  const files = [];
-
-  for (const message of thread) {
-    const role = normalizeClaudeRole(message.sender);
-    if (!role) continue;
-
-    const messageFiles = getClaudeMessageFiles(message, messages.length, role);
-    const blocks = getClaudeBlocks(message);
-    const text = getClaudeText(message, blocks);
-
-    if (!text && !blocks.length && !messageFiles.length) continue;
-
-    const record = {
-      index: messages.length,
-      id: message.uuid || null,
-      role,
-      model: message.model || data.model || null,
-      create_time: message.created_at || null,
-      text,
-      files: messageFiles
-    };
-
-    if (blocks.some((block) => block.type !== "text")) {
-      record.blocks = blocks;
-    }
-
-    messages.push(record);
-    files.push(...messageFiles);
-  }
+  const segment = buildClaudeMessageSegment(thread, data, null);
 
   return {
     exportedAt: new Date().toISOString(),
     source: "claude-api",
+    exportMode: CLAUDE_EXPORT_MODE_CURRENT,
     url: location.href,
     conversationId: data.uuid || conversationId,
     organizationId: orgId,
     title: data.name || document.title || "Claude conversation",
     create_time: data.created_at || null,
     update_time: data.updated_at || null,
-    counts: {
-      messages: messages.length,
-      user: messages.filter((message) => message.role === "user").length,
-      assistant: messages.filter((message) => message.role === "assistant").length,
-      files: files.length
-    },
-    messages,
-    files
+    counts: segment.counts,
+    messages: segment.messages,
+    files: segment.files
   };
 }
 
@@ -221,7 +211,8 @@ function getActiveClaudeThread(data) {
   const messages = data.chat_messages || [];
   if (!messages.length) return [];
 
-  const byUuid = new Map(messages.map((message) => [message.uuid, message]));
+  const byUuid = new Map(messages.filter((message) => message && message.uuid)
+    .map((message) => [message.uuid, message]));
   let nodeId = data.current_leaf_message_uuid || findLatestClaudeLeaf(messages);
   const ordered = [];
   const guard = new Set();
@@ -230,7 +221,7 @@ function getActiveClaudeThread(data) {
     guard.add(nodeId);
     const message = byUuid.get(nodeId);
     ordered.push(message);
-    nodeId = message.parent_message_uuid || null;
+    nodeId = getClaudeParentId(message);
   }
 
   if (!ordered.length) {
@@ -241,7 +232,7 @@ function getActiveClaudeThread(data) {
 }
 
 function findLatestClaudeLeaf(messages) {
-  const parentIds = new Set(messages.map((message) => message.parent_message_uuid).filter(Boolean));
+  const parentIds = new Set(messages.map((message) => getClaudeParentId(message)).filter(Boolean));
   const leaves = messages.filter((message) => message.uuid && !parentIds.has(message.uuid));
 
   leaves.sort((left, right) => {
@@ -251,6 +242,423 @@ function findLatestClaudeLeaf(messages) {
   });
 
   return (leaves[0] && leaves[0].uuid) || (messages[messages.length - 1] && messages[messages.length - 1].uuid);
+}
+
+function buildClaudeAllBranchesExport(data, conversationId, orgId) {
+  const context = buildClaudeTreeContext(data);
+  const exportedAt = new Date().toISOString();
+  const root = createClaudeBranchNode({
+    data,
+    conversationId,
+    orgId,
+    exportedAt,
+    branchPath: [],
+    branchIndex: null,
+    branchLabel: null,
+    parentMessageId: null,
+    startMessageId: null
+  });
+
+  if (!context.messages.length) {
+    root.localCounts = buildCounts(root.messages, root.files, 0, 0);
+    root.totalCounts = { ...root.localCounts };
+    return root;
+  }
+
+  const roots = getClaudeTrueRootMessages(context);
+  const missingParentRoots = getClaudeMissingParentRootMessages(context);
+  if (!roots.length && !missingParentRoots.length) {
+    const fallback = context.messages[0];
+    context.warnings.push(`No root message found; using ${fallback.uuid} as traversal root.`);
+    populateClaudeBranchNode(root, fallback.uuid, context, []);
+  } else if (roots.length === 1) {
+    populateClaudeBranchNode(root, roots[0].uuid, context, []);
+  } else {
+    root.startMessageId = null;
+    root.branches = roots.map((message, index) => buildClaudeChildBranchNode({
+      data,
+      conversationId,
+      orgId,
+      exportedAt,
+      context,
+      parentMessageId: null,
+      startMessageId: message.uuid,
+      branchPath: [index + 1],
+      branchIndex: index + 1,
+      siblingCount: roots.length,
+      seenPath: new Set()
+    }));
+  }
+
+  appendMissingParentClaudeComponents(root, context, data, conversationId, orgId, exportedAt, missingParentRoots);
+  appendUnvisitedClaudeComponents(root, context, data, conversationId, orgId, exportedAt);
+  applyClaudeBranchCounts(root);
+  if (context.warnings.length) root.warnings = context.warnings.slice();
+  return root;
+}
+
+function buildClaudeTreeContext(data) {
+  const messages = [];
+  const byUuid = new Map();
+  const apiIndexByUuid = new Map();
+  const warnings = [];
+
+  (data.chat_messages || []).forEach((message, index) => {
+    if (!message || !message.uuid) return;
+
+    if (byUuid.has(message.uuid)) {
+      warnings.push(`Duplicate message uuid ignored: ${message.uuid}`);
+      return;
+    }
+
+    messages.push(message);
+    byUuid.set(message.uuid, message);
+    apiIndexByUuid.set(message.uuid, index);
+  });
+
+  const childrenByParent = new Map();
+  for (const message of messages) {
+    const parentId = getClaudeParentId(message) || "";
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(message.uuid);
+  }
+
+  for (const children of childrenByParent.values()) {
+    children.sort((leftId, rightId) => compareClaudeMessageIds(leftId, rightId, byUuid, apiIndexByUuid));
+  }
+
+  return { messages, byUuid, apiIndexByUuid, childrenByParent, warnings, data, visited: new Set() };
+}
+
+function compareClaudeMessageIds(leftId, rightId, byUuid, apiIndexByUuid) {
+  const left = byUuid.get(leftId);
+  const right = byUuid.get(rightId);
+  const leftTime = Date.parse((left && left.created_at) || "") || 0;
+  const rightTime = Date.parse((right && right.created_at) || "") || 0;
+  if (leftTime !== rightTime) return leftTime - rightTime;
+
+  const leftIndex = apiIndexByUuid.get(leftId) ?? Number.MAX_SAFE_INTEGER;
+  const rightIndex = apiIndexByUuid.get(rightId) ?? Number.MAX_SAFE_INTEGER;
+  if (leftIndex !== rightIndex) return leftIndex - rightIndex;
+
+  return String(leftId).localeCompare(String(rightId));
+}
+
+function getClaudeTrueRootMessages(context) {
+  return context.messages
+    .filter((message) => !getClaudeParentId(message))
+    .sort((left, right) => compareClaudeMessageIds(left.uuid, right.uuid, context.byUuid, context.apiIndexByUuid));
+}
+
+function getClaudeMissingParentRootMessages(context) {
+  return context.messages
+    .filter((message) => {
+      const parentId = getClaudeParentId(message);
+      return parentId && !context.byUuid.has(parentId);
+    })
+    .sort((left, right) => compareClaudeMessageIds(left.uuid, right.uuid, context.byUuid, context.apiIndexByUuid));
+}
+
+function createClaudeBranchNode({
+  data,
+  conversationId,
+  orgId,
+  exportedAt,
+  branchPath,
+  branchIndex,
+  branchLabel,
+  parentMessageId,
+  startMessageId,
+  recovery = null
+}) {
+  return {
+    exportedAt,
+    source: "claude-api",
+    exportMode: CLAUDE_EXPORT_MODE_ALL,
+    branchStructure: CLAUDE_BRANCH_STRUCTURE,
+    url: location.href,
+    conversationId: data.uuid || conversationId,
+    organizationId: orgId,
+    title: data.name || document.title || "Claude conversation",
+    create_time: data.created_at || null,
+    update_time: data.updated_at || null,
+    branchPath,
+    branchIndex,
+    branchLabel,
+    parentMessageId,
+    startMessageId,
+    recovery,
+    localCounts: null,
+    totalCounts: null,
+    messages: [],
+    files: [],
+    branches: []
+  };
+}
+
+function buildClaudeChildBranchNode({
+  data,
+  conversationId,
+  orgId,
+  exportedAt,
+  context,
+  parentMessageId,
+  startMessageId,
+  branchPath,
+  branchIndex,
+  siblingCount,
+  seenPath
+}) {
+  const node = createClaudeBranchNode({
+    data,
+    conversationId,
+    orgId,
+    exportedAt,
+    branchPath,
+    branchIndex,
+    branchLabel: `${branchIndex} / ${siblingCount}`,
+    parentMessageId,
+    startMessageId
+  });
+
+  populateClaudeBranchNode(node, startMessageId, context, seenPath);
+  applyClaudeBranchCounts(node);
+  return node;
+}
+
+function populateClaudeBranchNode(node, startMessageId, context, incomingSeenPath) {
+  let nodeId = startMessageId;
+  const seenPath = new Set(incomingSeenPath || []);
+
+  while (nodeId) {
+    if (seenPath.has(nodeId)) {
+      context.warnings.push(`Cycle detected at message ${nodeId}; stopped branch ${node.branchPath.join(".") || "root"}.`);
+      return;
+    }
+
+    const message = context.byUuid.get(nodeId);
+    if (!message) {
+      context.warnings.push(`Missing message ${nodeId}; stopped branch ${node.branchPath.join(".") || "root"}.`);
+      return;
+    }
+
+    context.visited.add(nodeId);
+    seenPath.add(nodeId);
+    const normalized = normalizeClaudeMessage(message, context.data, node.messages.length, node.branchPath);
+    if (normalized) {
+      node.messages.push(normalized.record);
+      node.files.push(...normalized.files);
+      if (!node.startMessageId) node.startMessageId = normalized.record.id;
+    }
+
+    const children = context.childrenByParent.get(nodeId) || [];
+    if (!children.length) return;
+
+    if (children.length === 1) {
+      nodeId = children[0];
+      continue;
+    }
+
+    node.branches = children.map((childId, index) => buildClaudeChildBranchNode({
+      data: context.data,
+      conversationId: node.conversationId,
+      orgId: node.organizationId,
+      exportedAt: node.exportedAt,
+      context,
+      parentMessageId: nodeId,
+      startMessageId: childId,
+      branchPath: node.branchPath.concat(index + 1),
+      branchIndex: index + 1,
+      siblingCount: children.length,
+      seenPath
+    }));
+    return;
+  }
+}
+
+function appendUnvisitedClaudeComponents(root, context, data, conversationId, orgId, exportedAt) {
+  appendClaudeRecoveryComponents({
+    root,
+    context,
+    data,
+    conversationId,
+    orgId,
+    exportedAt,
+    recovery: "orphan-component",
+    labelPrefix: "orphan",
+    getNextMessage: () => getFirstUnvisitedClaudeMessage(context),
+    getWarning: (message, index) => `Unreachable message component found at ${message.uuid}; exported as orphan branch ${index}.`
+  });
+}
+
+function appendMissingParentClaudeComponents(root, context, data, conversationId, orgId, exportedAt, messages) {
+  let index = 0;
+  appendClaudeRecoveryComponents({
+    root,
+    context,
+    data,
+    conversationId,
+    orgId,
+    exportedAt,
+    recovery: "missing-parent",
+    labelPrefix: "missing parent",
+    getNextMessage: () => {
+      while (index < messages.length) {
+        const message = messages[index++];
+        if (!context.visited.has(message.uuid)) return message;
+      }
+      return null;
+    },
+    getWarning: (message, recoveryIndex) => (
+      `Missing parent ${message.parent_message_uuid} for message ${message.uuid}; `
+      + `exported as missing-parent branch ${recoveryIndex}.`
+    )
+  });
+}
+
+function appendClaudeRecoveryComponents({
+  root,
+  context,
+  data,
+  conversationId,
+  orgId,
+  exportedAt,
+  recovery,
+  labelPrefix,
+  getNextMessage,
+  getWarning
+}) {
+  let orphanIndex = 1;
+  let message = getNextMessage();
+
+  while (message) {
+    const branchIndex = root.branches.length + 1;
+    const branchPath = [branchIndex];
+    const node = createClaudeBranchNode({
+      data,
+      conversationId,
+      orgId,
+      exportedAt,
+      branchPath,
+      branchIndex,
+      branchLabel: `${labelPrefix} ${orphanIndex}`,
+      parentMessageId: message.parent_message_uuid || null,
+      startMessageId: message.uuid,
+      recovery
+    });
+
+    context.warnings.push(getWarning(message, orphanIndex));
+    populateClaudeBranchNode(node, message.uuid, context, new Set());
+    applyClaudeBranchCounts(node);
+    root.branches.push(node);
+
+    orphanIndex++;
+    message = getNextMessage();
+  }
+}
+
+function getFirstUnvisitedClaudeMessage(context) {
+  return context.messages.find((message) => !context.visited.has(message.uuid)) || null;
+}
+
+function applyClaudeBranchCounts(node) {
+  const hasBranches = node.branches.length > 0;
+  const hasRealBranches = node.branches.some((branch) => !branch.recovery);
+  const localBranchPointCount = hasRealBranches ? 1 : 0;
+  const localLeafBranchCount = hasBranches
+    ? hasRealBranches
+      ? 0
+      : (node.messages.length ? 1 : 0)
+    : (node.messages.length ? 1 : 0);
+  node.localCounts = buildCounts(node.messages, node.files, localBranchPointCount, localLeafBranchCount);
+  node.totalCounts = { ...node.localCounts };
+
+  for (const branch of node.branches) {
+    if (!branch.totalCounts) applyClaudeBranchCounts(branch);
+    addCounts(node.totalCounts, branch.totalCounts);
+  }
+
+  return node.totalCounts;
+}
+
+function buildClaudeMessageSegment(thread, data, branchPath) {
+  const messages = [];
+  const files = [];
+
+  for (const message of thread) {
+    const normalized = normalizeClaudeMessage(message, data, messages.length, branchPath);
+    if (!normalized) continue;
+
+    messages.push(normalized.record);
+    files.push(...normalized.files);
+  }
+
+  return {
+    messages,
+    files,
+    counts: buildLinearCounts(messages, files)
+  };
+}
+
+function normalizeClaudeMessage(message, data, messageIndex, branchPath) {
+  const role = normalizeClaudeRole(message.sender);
+  if (!role) return null;
+
+  const messageFiles = getClaudeMessageFiles(message, messageIndex, role, branchPath);
+  const blocks = getClaudeBlocks(message);
+  const text = getClaudeText(message, blocks);
+
+  if (!text && !blocks.length && !messageFiles.length) return null;
+
+  const record = {
+    index: messageIndex,
+    id: message.uuid || null,
+    role,
+    model: message.model || data.model || null,
+    create_time: message.created_at || null,
+    text,
+    files: messageFiles
+  };
+
+  if (blocks.some((block) => block.type !== "text")) {
+    record.blocks = blocks;
+  }
+
+  return { record, files: messageFiles };
+}
+
+function buildCounts(messages, files, branchPoints, leafBranches) {
+  return {
+    messages: messages.length,
+    user: messages.filter((message) => message.role === "user").length,
+    assistant: messages.filter((message) => message.role === "assistant").length,
+    files: files.length,
+    branchPoints,
+    leafBranches
+  };
+}
+
+function buildLinearCounts(messages, files) {
+  return {
+    messages: messages.length,
+    user: messages.filter((message) => message.role === "user").length,
+    assistant: messages.filter((message) => message.role === "assistant").length,
+    files: files.length
+  };
+}
+
+function addCounts(target, source) {
+  target.messages += source.messages;
+  target.user += source.user;
+  target.assistant += source.assistant;
+  target.files += source.files;
+  target.branchPoints += source.branchPoints;
+  target.leafBranches += source.leafBranches;
+}
+
+function getClaudeParentId(message) {
+  const parentId = message && message.parent_message_uuid;
+  return !parentId || parentId === CLAUDE_ROOT_PARENT_UUID ? null : parentId;
 }
 
 function normalizeClaudeRole(sender) {
@@ -308,21 +716,21 @@ function getClaudeText(message, blocks) {
   return textParts.join("\n").trim();
 }
 
-function getClaudeMessageFiles(message, messageIndex, owner) {
+function getClaudeMessageFiles(message, messageIndex, owner, branchPath) {
   const out = [];
 
   for (const attachment of message.attachments || []) {
-    out.push(normalizeClaudeFile(attachment, message, messageIndex, owner, "attachment"));
+    out.push(normalizeClaudeFile(attachment, message, messageIndex, owner, "attachment", branchPath));
   }
 
   for (const file of message.files_v2 || []) {
-    out.push(normalizeClaudeFile(file, message, messageIndex, owner, "files_v2"));
+    out.push(normalizeClaudeFile(file, message, messageIndex, owner, "files_v2", branchPath));
   }
 
   return dedupeFiles(out);
 }
 
-function normalizeClaudeFile(file, message, messageIndex, owner, source) {
+function normalizeClaudeFile(file, message, messageIndex, owner, source, branchPath) {
   const id = String(
     file.uuid
       || file.id
@@ -334,8 +742,7 @@ function normalizeClaudeFile(file, message, messageIndex, owner, source) {
   );
   const name = file.file_name || file.name || file.filename || id || "attachment";
   const mime = file.mime_type || file.file_type || file.type || "";
-
-  return {
+  const out = {
     messageIndex,
     messageId: message.uuid || null,
     owner,
@@ -346,6 +753,12 @@ function normalizeClaudeFile(file, message, messageIndex, owner, source) {
     kind: inferFileKind(name, mime),
     source
   };
+
+  if (Array.isArray(branchPath)) {
+    out.branchPath = branchPath.slice();
+  }
+
+  return out;
 }
 
 function dedupeFiles(files) {
@@ -388,6 +801,7 @@ function buildClaudeDomFallbackExport(conversationId, apiError) {
   return {
     exportedAt: new Date().toISOString(),
     source: "claude-dom-fallback",
+    exportMode: CLAUDE_EXPORT_MODE_CURRENT,
     apiError: apiError && apiError.message ? apiError.message : null,
     url: location.href,
     conversationId,
@@ -512,8 +926,8 @@ function downloadAndReturn(out, downloadName) {
 
   out.downloadName = downloadName;
   window.__lastClaudeExport = out;
-  console.log("[claude-export] DONE", out.source, out.counts);
-  console.table(out.files);
+  console.log("[claude-export] DONE", out.source, out.totalCounts || out.counts);
+  console.table(out.files || []);
 
   return out;
 }
