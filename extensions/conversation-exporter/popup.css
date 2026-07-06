@@ -26,6 +26,11 @@ h1 {
   letter-spacing: 0;
 }
 
+.button-area {
+  display: grid;
+  gap: 8px;
+}
+
 button {
   width: 100%;
   min-height: 38px;
@@ -40,6 +45,15 @@ button {
 
 button:hover {
   background: #115e59;
+}
+
+button[data-variant="secondary"] {
+  color: #0f766e;
+  background: #d9f3ee;
+}
+
+button[data-variant="secondary"]:hover {
+  background: #c5eae4;
 }
 
 button:disabled {
@@ -81,5 +95,14 @@ button:disabled {
 
   #status[data-state="success"] {
     color: #86efac;
+  }
+
+  button[data-variant="secondary"] {
+    color: #99f6e4;
+    background: #134e4a;
+  }
+
+  button[data-variant="secondary"]:hover {
+    background: #115e59;
   }
 }
