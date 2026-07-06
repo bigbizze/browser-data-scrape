@@ -1,5 +1,7 @@
 const CHATGPT_CONVERSATION_PATH_RE = /(?:^|\/)c\/[0-9a-f-]{36}(?:\/|$)/i;
 const CLAUDE_ID_RE = /^[0-9a-f-]{16,}$/i;
+const CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
+const CHATGPT_EXPORT_MODE_ALL = "all-branches";
 const CLAUDE_EXPORT_MODE_CURRENT = "current-branch";
 const CLAUDE_EXPORT_MODE_ALL = "all-branches";
 
@@ -121,15 +123,53 @@ async function initializePopup() {
   }
 
   if (target.type === "chatgpt") {
-    renderButtons([{
-      label: "Export conversation",
-      onClick: () => runExport(tab, target)
-    }]);
-    setStatus("Ready.");
+    await initializeChatGptButtons(tab, target);
     return;
   }
 
   await initializeClaudeButtons(tab, target);
+}
+
+async function initializeChatGptButtons(tab, target) {
+  setStatus("Checking ChatGPT branches...");
+  renderDisabledButton();
+
+  let probe = null;
+  try {
+    probe = getResult(await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: probeChatGptBranchesInPage
+    }));
+  } catch (error) {
+    console.warn("[conversation-exporter] ChatGPT branch probe failed", error);
+  }
+
+  if (probe && probe.ok && probe.hasBranches) {
+    renderButtons([
+      {
+        label: "Export current branch",
+        onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_CURRENT)
+      },
+      {
+        label: "Export all branches",
+        variant: "secondary",
+        onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_ALL)
+      }
+    ]);
+    setStatus(`Ready. Found ${probe.branchPoints} branch ${probe.branchPoints === 1 ? "point" : "points"}.`);
+    return;
+  }
+
+  renderButtons([{
+    label: "Export conversation",
+    onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_CURRENT)
+  }]);
+
+  if (probe && probe.ok) {
+    setStatus("Ready.");
+  } else {
+    setStatus("Ready. Branch detection unavailable.");
+  }
 }
 
 async function initializeClaudeButtons(tab, target) {
@@ -179,6 +219,14 @@ async function runExport(tab, target, mode = null) {
   setStatus(`Exporting ${target.label}...`);
 
   try {
+    if (target.type === "chatgpt") {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: setChatGptExportModeInPage,
+        args: [mode || CHATGPT_EXPORT_MODE_CURRENT]
+      });
+    }
+
     if (target.type === "claude") {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
@@ -205,6 +253,10 @@ async function runExport(tab, target, mode = null) {
   }
 }
 
+function setChatGptExportModeInPage(mode) {
+  window.__chatGptExportMode = mode;
+}
+
 function setClaudeExportModeInPage(mode) {
   window.__claudeExportMode = mode;
 }
@@ -214,11 +266,161 @@ function formatSuccessStatus(result) {
   const messageCount = Number.isFinite(counts.messages) ? counts.messages : 0;
   const fileCount = Number.isFinite(counts.files) ? counts.files : 0;
   const fallbackNote = result.source === "claude-dom-fallback" ? " visible" : "";
-  const branchNote = result.exportMode === CLAUDE_EXPORT_MODE_ALL && counts.leafBranches
+  const branchNote = result.exportMode === "all-branches" && counts.leafBranches
     ? ` across ${counts.leafBranches} leaf branches`
     : "";
 
   return `Downloaded ${messageCount}${fallbackNote} messages${branchNote} (${fileCount} files listed).`;
+}
+
+async function probeChatGptBranchesInPage() {
+  const conversationId = getConversationId();
+  if (!conversationId) {
+    return { ok: false, error: "No ChatGPT conversation id found in the URL." };
+  }
+
+  try {
+    const data = await fetchChatGptConversation(conversationId);
+    const stats = getChatGptBranchStats(data.mapping || {});
+    return {
+      ok: true,
+      hasBranches: stats.branchPoints > 0,
+      branchPoints: stats.branchPoints,
+      branchedChildren: stats.branchedChildren
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error && error.message ? error.message : "Could not inspect ChatGPT branches."
+    };
+  }
+
+  function getConversationId() {
+    const match = location.pathname.match(/\/c\/([0-9a-f-]{36})/i)
+      || location.pathname.match(/([0-9a-f-]{36})/i);
+    return match ? match[1] : null;
+  }
+
+  async function fetchChatGptConversation(convId) {
+    const token = await getAccessToken();
+    const response = await fetch(`${location.origin}/backend-api/conversation/${convId}`, {
+      credentials: "include",
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Conversation request failed with HTTP ${response.status}.`);
+    }
+
+    const data = await response.json();
+    if (!data || !data.mapping) {
+      throw new Error("Unexpected ChatGPT response with no mapping.");
+    }
+
+    return data;
+  }
+
+  async function getAccessToken() {
+    const response = await fetch("/api/auth/session", { credentials: "include" });
+    if (!response.ok) {
+      throw new Error(`Session request failed with HTTP ${response.status}.`);
+    }
+
+    const session = await response.json();
+    if (!session || !session.accessToken) {
+      throw new Error("No access token found in /api/auth/session.");
+    }
+
+    return session.accessToken;
+  }
+
+  function getChatGptBranchStats(mapping) {
+    const childrenByParent = new Map();
+    for (const [nodeId, node] of Object.entries(mapping)) {
+      const parentId = node && node.parent;
+      if (!parentId || !mapping[parentId]) continue;
+      if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+      childrenByParent.get(parentId).push(nodeId);
+    }
+
+    let branchPoints = 0;
+    let branchedChildren = 0;
+
+    for (const [nodeId, node] of Object.entries(mapping)) {
+      if (!node || typeof node !== "object") continue;
+      const children = unique([
+        ...(Array.isArray(node.children) ? node.children.filter((childId) => (
+          childId && mapping[childId] && mapping[childId].parent === nodeId
+        )) : []),
+        ...(childrenByParent.get(nodeId) || [])
+      ].filter((childId) => childId && mapping[childId]));
+      if (children.length > 1) {
+        branchPoints++;
+        branchedChildren += children.length;
+      }
+    }
+
+    return { branchPoints, branchedChildren };
+  }
+
+  function unique(values) {
+    const seen = new Set();
+    const out = [];
+
+    for (const value of values) {
+      if (!seen.has(value)) {
+        seen.add(value);
+        out.push(value);
+      }
+    }
+
+    return out;
+  }
+}
+
+function getChatGptBranchStats(mapping) {
+  const childrenByParent = new Map();
+  for (const [nodeId, node] of Object.entries(mapping)) {
+    const parentId = node && node.parent;
+    if (!parentId || !mapping[parentId]) continue;
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(nodeId);
+  }
+
+  let branchPoints = 0;
+  let branchedChildren = 0;
+
+  for (const [nodeId, node] of Object.entries(mapping)) {
+    if (!node || typeof node !== "object") continue;
+    const children = unique([
+      ...(Array.isArray(node.children) ? node.children.filter((childId) => (
+        childId && mapping[childId] && mapping[childId].parent === nodeId
+      )) : []),
+      ...(childrenByParent.get(nodeId) || [])
+    ].filter((childId) => childId && mapping[childId]));
+    if (children.length > 1) {
+      branchPoints++;
+      branchedChildren += children.length;
+    }
+  }
+
+  return { branchPoints, branchedChildren };
+}
+
+function unique(values) {
+  const seen = new Set();
+  const out = [];
+
+  for (const value of values) {
+    if (!seen.has(value)) {
+      seen.add(value);
+      out.push(value);
+    }
+  }
+
+  return out;
 }
 
 async function probeClaudeBranchesInPage() {
