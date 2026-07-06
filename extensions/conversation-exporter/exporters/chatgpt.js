@@ -1,3 +1,7 @@
+var CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
+var CHATGPT_EXPORT_MODE_ALL = "all-branches";
+var CHATGPT_BRANCH_STRUCTURE = "segment-tree";
+
 (async () => {
   if (window.__chatGptBackendExportInProgress) {
     return {
@@ -6,13 +10,16 @@
     };
   }
 
+  const exportMode = normalizeChatGptExportMode(window.__chatGptExportMode);
   window.__chatGptBackendExportInProgress = true;
 
   try {
-    const out = await exportChatBackend();
+    const out = await exportChatBackend(exportMode);
     return {
       ok: true,
-      counts: out.counts,
+      source: out.source,
+      exportMode: out.exportMode || exportMode,
+      counts: out.totalCounts || out.counts,
       conversationId: out.conversationId,
       downloadName: out.downloadName
     };
@@ -23,20 +30,43 @@
       error: error && error.message ? error.message : String(error)
     };
   } finally {
+    delete window.__chatGptExportMode;
     window.__chatGptBackendExportInProgress = false;
   }
 })();
 
-async function exportChatBackend() {
-  const origin = location.origin;
+function normalizeChatGptExportMode(mode) {
+  return mode === CHATGPT_EXPORT_MODE_ALL ? CHATGPT_EXPORT_MODE_ALL : CHATGPT_EXPORT_MODE_CURRENT;
+}
 
-  const token = await getAccessToken();
-  const headers = { Authorization: `Bearer ${token}` };
-
+async function exportChatBackend(exportMode) {
   const convId = getConversationId();
   if (!convId) {
     throw new Error("No conversation id in the URL.");
   }
+
+  const conv = await fetchChatGptConversation(convId);
+  const out = exportMode === CHATGPT_EXPORT_MODE_ALL
+    ? buildChatGptAllBranchesExport(conv, convId)
+    : await buildChatGptCurrentBranchExport(conv, convId);
+  const downloadName = exportMode === CHATGPT_EXPORT_MODE_ALL
+    ? `chatgpt-all-branches-export-${Date.now()}.json`
+    : `chatgpt-backend-export-${Date.now()}.json`;
+
+  downloadJson(out, downloadName);
+
+  out.downloadName = downloadName;
+  window.__lastBackendExport = out;
+  console.log("[backend-export] DONE", out.totalCounts || out.counts);
+  console.table(out.files || []);
+
+  return out;
+}
+
+async function fetchChatGptConversation(convId) {
+  const origin = location.origin;
+  const token = await getAccessToken();
+  const headers = { Authorization: `Bearer ${token}` };
 
   const convResponse = await fetch(`${origin}/backend-api/conversation/${convId}`, {
     headers,
@@ -52,38 +82,370 @@ async function exportChatBackend() {
     throw new Error(`Unexpected response with no mapping: ${JSON.stringify(conv).slice(0, 200)}`);
   }
 
-  const branch = await getRenderedBranchOrder(conv.mapping, conv.current_node);
-  const order = branch.order;
-  const { messages, files } = buildMessages(order, conv.mapping);
+  return conv;
+}
 
-  const out = {
+async function buildChatGptCurrentBranchExport(conv, convId) {
+  const branch = await getRenderedBranchOrder(conv.mapping, conv.current_node);
+  const segment = buildMessages(branch.order, conv.mapping, null);
+
+  return {
     exportedAt: new Date().toISOString(),
     source: "backend-api",
+    exportMode: CHATGPT_EXPORT_MODE_CURRENT,
     branchSource: branch.source,
     url: location.href,
-    conversationId: convId,
+    conversationId: conv.conversation_id || convId,
     title: conv.title || document.title,
     create_time: conv.create_time || null,
     update_time: conv.update_time || null,
-    counts: {
-      messages: messages.length,
-      user: messages.filter((message) => message.role === "user").length,
-      assistant: messages.filter((message) => message.role === "assistant").length,
-      files: files.length
-    },
-    messages,
-    files
+    counts: buildLinearCounts(segment.messages, segment.files),
+    messages: segment.messages,
+    files: segment.files
   };
+}
 
-  const downloadName = `chatgpt-backend-export-${Date.now()}.json`;
-  downloadJson(out, downloadName);
+function buildChatGptAllBranchesExport(conv, convId) {
+  const context = buildChatGptTreeContext(conv.mapping);
+  context.conv = conv;
+  const exportedAt = new Date().toISOString();
+  const root = createChatGptBranchNode({
+    conv,
+    convId,
+    exportedAt,
+    branchPath: [],
+    branchIndex: null,
+    branchLabel: null,
+    parentMessageId: null,
+    startMessageId: null
+  });
 
-  out.downloadName = downloadName;
-  window.__lastBackendExport = out;
-  console.log("[backend-export] DONE", out.counts);
-  console.table(files);
+  if (!context.nodeIds.length) {
+    root.localCounts = buildCounts(root.messages, root.files, 0, 0);
+    root.totalCounts = { ...root.localCounts };
+    return root;
+  }
 
-  return out;
+  const roots = getChatGptTrueRootNodeIds(context);
+  const missingParentRoots = getChatGptMissingParentRootNodeIds(context);
+
+  if (!roots.length && !missingParentRoots.length) {
+    const fallback = context.nodeIds[0];
+    context.warnings.push(`No root node found; using ${fallback} as traversal root.`);
+    populateChatGptBranchNode(root, fallback, context, []);
+  } else if (roots.length === 1) {
+    populateChatGptBranchNode(root, roots[0], context, []);
+  } else {
+    root.startMessageId = null;
+    root.branches = roots.map((nodeId, index) => buildChatGptChildBranchNode({
+      conv,
+      convId,
+      exportedAt,
+      context,
+      parentMessageId: null,
+      startMessageId: nodeId,
+      branchPath: [index + 1],
+      branchIndex: index + 1,
+      siblingCount: roots.length,
+      seenPath: new Set()
+    }));
+  }
+
+  appendMissingParentChatGptComponents(root, context, conv, convId, exportedAt, missingParentRoots);
+  appendUnvisitedChatGptComponents(root, context, conv, convId, exportedAt);
+  applyChatGptBranchCounts(root);
+  if (context.warnings.length) root.warnings = context.warnings.slice();
+  return root;
+}
+
+function buildChatGptTreeContext(mapping) {
+  const nodeIds = [];
+  const warnings = [];
+
+  for (const [nodeId, node] of Object.entries(mapping || {})) {
+    if (!nodeId || !node || typeof node !== "object") continue;
+    nodeIds.push(nodeId);
+  }
+
+  const childrenByParent = new Map();
+  for (const nodeId of nodeIds) {
+    const node = mapping[nodeId];
+    const parentId = node && node.parent;
+    if (!parentId || !mapping[parentId]) continue;
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(nodeId);
+  }
+
+  return { mapping, nodeIds, childrenByParent, warnings, visited: new Set() };
+}
+
+function getChatGptTrueRootNodeIds(context) {
+  return context.nodeIds.filter((nodeId) => {
+    const parentId = context.mapping[nodeId] && context.mapping[nodeId].parent;
+    return !parentId;
+  });
+}
+
+function getChatGptMissingParentRootNodeIds(context) {
+  return context.nodeIds.filter((nodeId) => {
+    const parentId = context.mapping[nodeId] && context.mapping[nodeId].parent;
+    return parentId && !context.mapping[parentId];
+  });
+}
+
+function createChatGptBranchNode({
+  conv,
+  convId,
+  exportedAt,
+  branchPath,
+  branchIndex,
+  branchLabel,
+  parentMessageId,
+  startMessageId,
+  recovery = null
+}) {
+  return {
+    exportedAt,
+    source: "backend-api",
+    exportMode: CHATGPT_EXPORT_MODE_ALL,
+    branchStructure: CHATGPT_BRANCH_STRUCTURE,
+    url: location.href,
+    conversationId: conv.conversation_id || convId,
+    title: conv.title || document.title,
+    create_time: conv.create_time || null,
+    update_time: conv.update_time || null,
+    branchPath,
+    branchIndex,
+    branchLabel,
+    parentMessageId,
+    startMessageId,
+    recovery,
+    localCounts: null,
+    totalCounts: null,
+    messages: [],
+    files: [],
+    branches: []
+  };
+}
+
+function buildChatGptChildBranchNode({
+  conv,
+  convId,
+  exportedAt,
+  context,
+  parentMessageId,
+  startMessageId,
+  branchPath,
+  branchIndex,
+  siblingCount,
+  seenPath
+}) {
+  const node = createChatGptBranchNode({
+    conv,
+    convId,
+    exportedAt,
+    branchPath,
+    branchIndex,
+    branchLabel: `${branchIndex} / ${siblingCount}`,
+    parentMessageId,
+    startMessageId
+  });
+
+  populateChatGptBranchNode(node, startMessageId, context, seenPath);
+  applyChatGptBranchCounts(node);
+  return node;
+}
+
+function populateChatGptBranchNode(node, startNodeId, context, incomingSeenPath) {
+  let nodeId = startNodeId;
+  const seenPath = new Set(incomingSeenPath || []);
+
+  while (nodeId) {
+    if (seenPath.has(nodeId)) {
+      context.warnings.push(`Cycle detected at node ${nodeId}; stopped branch ${node.branchPath.join(".") || "root"}.`);
+      return;
+    }
+
+    const mappingNode = context.mapping[nodeId];
+    if (!mappingNode) {
+      context.warnings.push(`Missing node ${nodeId}; stopped branch ${node.branchPath.join(".") || "root"}.`);
+      return;
+    }
+
+    context.visited.add(nodeId);
+    seenPath.add(nodeId);
+
+    const segment = buildMessages([nodeId], context.mapping, node.branchPath, node.messages.length);
+    if (segment.messages.length) {
+      node.messages.push(segment.messages[0]);
+      node.files.push(...segment.files);
+      if (!node.startMessageId) node.startMessageId = segment.messages[0].id;
+    }
+
+    const children = getChatGptChildNodeIds(nodeId, context);
+    if (!children.length) return;
+
+    if (children.length === 1) {
+      nodeId = children[0];
+      continue;
+    }
+
+    node.branches = children.map((childId, index) => buildChatGptChildBranchNode({
+      conv: context.conv,
+      convId: node.conversationId,
+      exportedAt: node.exportedAt,
+      context,
+      parentMessageId: nodeId,
+      startMessageId: childId,
+      branchPath: node.branchPath.concat(index + 1),
+      branchIndex: index + 1,
+      siblingCount: children.length,
+      seenPath
+    }));
+    return;
+  }
+}
+
+function getChatGptChildNodeIds(nodeId, context) {
+  const node = context.mapping[nodeId];
+  const children = [];
+  const seen = new Set();
+
+  if (Array.isArray(node && node.children)) {
+    for (const childId of node.children) {
+      addChatGptChildNodeId(children, seen, childId, nodeId, context, true);
+    }
+  }
+
+  for (const childId of context.childrenByParent.get(nodeId) || []) {
+    addChatGptChildNodeId(children, seen, childId, nodeId, context, false);
+  }
+
+  return children;
+}
+
+function addChatGptChildNodeId(children, seen, childId, parentId, context, warnOnMismatch) {
+  if (!childId || seen.has(childId)) return;
+
+  const child = context.mapping[childId];
+  if (!child) {
+    context.warnings.push(`Missing child ${childId} referenced by node ${parentId}; ignored.`);
+    return;
+  }
+
+  if (child.parent !== parentId) {
+    if (warnOnMismatch) {
+      context.warnings.push(
+        `Child ${childId} referenced by node ${parentId} has parent ${child.parent || "null"}; ignored.`
+      );
+    }
+    return;
+  }
+
+  seen.add(childId);
+  children.push(childId);
+}
+
+function appendMissingParentChatGptComponents(root, context, conv, convId, exportedAt, nodeIds) {
+  let index = 0;
+  appendChatGptRecoveryComponents({
+    root,
+    context,
+    conv,
+    convId,
+    exportedAt,
+    recovery: "missing-parent",
+    labelPrefix: "missing parent",
+    getNextNodeId: () => {
+      while (index < nodeIds.length) {
+        const nodeId = nodeIds[index++];
+        if (!context.visited.has(nodeId)) return nodeId;
+      }
+      return null;
+    },
+    getWarning: (nodeId, recoveryIndex) => (
+      `Missing parent ${context.mapping[nodeId].parent} for node ${nodeId}; `
+      + `exported as missing-parent branch ${recoveryIndex}.`
+    )
+  });
+}
+
+function appendUnvisitedChatGptComponents(root, context, conv, convId, exportedAt) {
+  appendChatGptRecoveryComponents({
+    root,
+    context,
+    conv,
+    convId,
+    exportedAt,
+    recovery: "orphan-component",
+    labelPrefix: "orphan",
+    getNextNodeId: () => getFirstUnvisitedChatGptNodeId(context),
+    getWarning: (nodeId, index) => `Unreachable node component found at ${nodeId}; exported as orphan branch ${index}.`
+  });
+}
+
+function appendChatGptRecoveryComponents({
+  root,
+  context,
+  conv,
+  convId,
+  exportedAt,
+  recovery,
+  labelPrefix,
+  getNextNodeId,
+  getWarning
+}) {
+  let orphanIndex = 1;
+  let nodeId = getNextNodeId();
+
+  while (nodeId) {
+    const branchIndex = root.branches.length + 1;
+    const branchPath = [branchIndex];
+    const mappingNode = context.mapping[nodeId] || {};
+    const node = createChatGptBranchNode({
+      conv,
+      convId,
+      exportedAt,
+      branchPath,
+      branchIndex,
+      branchLabel: `${labelPrefix} ${orphanIndex}`,
+      parentMessageId: mappingNode.parent || null,
+      startMessageId: nodeId,
+      recovery
+    });
+
+    context.warnings.push(getWarning(nodeId, orphanIndex));
+    populateChatGptBranchNode(node, nodeId, context, new Set());
+    applyChatGptBranchCounts(node);
+    root.branches.push(node);
+
+    orphanIndex++;
+    nodeId = getNextNodeId();
+  }
+}
+
+function getFirstUnvisitedChatGptNodeId(context) {
+  return context.nodeIds.find((nodeId) => !context.visited.has(nodeId)) || null;
+}
+
+function applyChatGptBranchCounts(node) {
+  const hasBranches = node.branches.length > 0;
+  const hasRealBranches = node.branches.some((branch) => !branch.recovery);
+  const localBranchPointCount = hasRealBranches ? 1 : 0;
+  const localLeafBranchCount = hasBranches
+    ? hasRealBranches
+      ? 0
+      : (node.messages.length ? 1 : 0)
+    : (node.messages.length ? 1 : 0);
+  node.localCounts = buildCounts(node.messages, node.files, localBranchPointCount, localLeafBranchCount);
+  node.totalCounts = { ...node.localCounts };
+
+  for (const branch of node.branches) {
+    if (!branch.totalCounts) applyChatGptBranchCounts(branch);
+    addCounts(node.totalCounts, branch.totalCounts);
+  }
+
+  return node.totalCounts;
 }
 
 async function getAccessToken() {
@@ -321,7 +683,7 @@ function findLeafNode(mapping) {
     || Object.keys(mapping)[0];
 }
 
-function buildMessages(order, mapping) {
+function buildMessages(order, mapping, branchPath = null, startIndex = 0) {
   const messages = [];
   const files = [];
 
@@ -332,14 +694,16 @@ function buildMessages(order, mapping) {
 
     const content = message.content || {};
     const messageFiles = [];
-    const text = getTextAndAssetFiles(content, message, messages.length, messageFiles);
+    const messageIndex = startIndex + messages.length;
+    const text = getTextAndAssetFiles(content, message, messageIndex, messageFiles);
 
-    addAttachmentFiles(message, messages.length, messageFiles);
+    addAttachmentFiles(message, messageIndex, messageFiles);
+    if (branchPath) addBranchPathToFiles(messageFiles, branchPath);
 
     if (!text && messageFiles.length === 0) continue;
 
     const record = {
-      index: messages.length,
+      index: messageIndex,
       id: message.id,
       role: message.author.role,
       model: (message.metadata && message.metadata.model_slug) || null,
@@ -353,6 +717,12 @@ function buildMessages(order, mapping) {
   }
 
   return { messages, files };
+}
+
+function addBranchPathToFiles(files, branchPath) {
+  for (const file of files) {
+    file.branchPath = branchPath.slice();
+  }
 }
 
 function shouldIncludeMessage(message) {
@@ -422,6 +792,35 @@ function normalizeFileId(id) {
   return String(id || "")
     .replace(/^file-service:\/\//, "")
     .replace(/^sediment:\/\//, "");
+}
+
+function buildLinearCounts(messages, files) {
+  return {
+    messages: messages.length,
+    user: messages.filter((message) => message.role === "user").length,
+    assistant: messages.filter((message) => message.role === "assistant").length,
+    files: files.length
+  };
+}
+
+function buildCounts(messages, files, branchPoints, leafBranches) {
+  return {
+    messages: messages.length,
+    user: messages.filter((message) => message.role === "user").length,
+    assistant: messages.filter((message) => message.role === "assistant").length,
+    files: files.length,
+    branchPoints,
+    leafBranches
+  };
+}
+
+function addCounts(target, source) {
+  target.messages += source.messages;
+  target.user += source.user;
+  target.assistant += source.assistant;
+  target.files += source.files;
+  target.branchPoints += source.branchPoints;
+  target.leafBranches += source.leafBranches;
 }
 
 function downloadJson(data, downloadName) {
