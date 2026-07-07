@@ -3,6 +3,7 @@ const CLAUDE_ID_RE = /^[0-9a-f-]{16,}$/i;
 const CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
 const CHATGPT_EXPORT_MODE_ALL = "all-branches";
 const CHATGPT_EXPORT_MODE_BACKEND_CURRENT = "backend-current";
+const CHATGPT_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
 const CLAUDE_EXPORT_MODE_CURRENT = "current-branch";
 const CLAUDE_EXPORT_MODE_ALL = "all-branches";
 const CLAUDE_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
@@ -148,6 +149,14 @@ async function initializeChatGptButtons(tab, target) {
   }
 
   if (probe && probe.ok && probe.hasBranches) {
+    const fileCount = Number.isFinite(probe.fileCount) ? probe.fileCount : 0;
+    const downloadFilesButton = {
+      label: fileCount ? `Download all files (${fileCount})` : "Download all files",
+      variant: "secondary",
+      disabled: fileCount <= 0,
+      onClick: fileCount > 0 ? () => runExport(tab, target, CHATGPT_EXPORT_MODE_DOWNLOAD_FILES) : null
+    };
+
     renderButtons([
       {
         label: "Export current branch",
@@ -157,18 +166,28 @@ async function initializeChatGptButtons(tab, target) {
         label: "Export all branches",
         variant: "secondary",
         onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_ALL)
-      }
+      },
+      downloadFilesButton
     ]);
-    setStatus(`Ready. Found ${probe.branchPoints} branch ${probe.branchPoints === 1 ? "point" : "points"}.`);
+    setStatus(formatChatGptReadyStatus(probe));
     return;
   }
 
   if (probe && probe.ok) {
-    renderButtons([{
-      label: "Export conversation",
-      onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_BACKEND_CURRENT)
-    }]);
-    setStatus("Ready.");
+    const fileCount = Number.isFinite(probe.fileCount) ? probe.fileCount : 0;
+    renderButtons([
+      {
+        label: "Export conversation",
+        onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_BACKEND_CURRENT)
+      },
+      {
+        label: fileCount ? `Download all files (${fileCount})` : "Download all files",
+        variant: "secondary",
+        disabled: fileCount <= 0,
+        onClick: fileCount > 0 ? () => runExport(tab, target, CHATGPT_EXPORT_MODE_DOWNLOAD_FILES) : null
+      }
+    ]);
+    setStatus(formatChatGptReadyStatus(probe));
   } else {
     renderButtons([{
       label: "Export conversation",
@@ -282,7 +301,7 @@ function setClaudeExportModeInPage(mode) {
 function formatSuccessStatus(result) {
   const counts = result.counts || {};
 
-  if (result.exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
+  if (result.exportMode === CHATGPT_EXPORT_MODE_DOWNLOAD_FILES || result.exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
     const fileCount = Number.isFinite(counts.files) ? counts.files : 0;
     const downloaded = Number.isFinite(counts.downloaded) ? counts.downloaded : fileCount;
     const failed = Number.isFinite(counts.failed) ? counts.failed : 0;
@@ -314,6 +333,20 @@ function formatClaudeReadyStatus(probe) {
   return parts.join(" ");
 }
 
+function formatChatGptReadyStatus(probe) {
+  const parts = ["Ready."];
+
+  if (probe.branchPoints > 0) {
+    parts.push(`Found ${probe.branchPoints} branch ${probe.branchPoints === 1 ? "point" : "points"}.`);
+  }
+
+  if (probe.fileCount > 0) {
+    parts.push(`Found ${probe.fileCount} downloadable ${probe.fileCount === 1 ? "file" : "files"}.`);
+  }
+
+  return parts.join(" ");
+}
+
 async function probeChatGptBranchesInPage() {
   const conversationId = getConversationId();
   if (!conversationId) {
@@ -321,13 +354,27 @@ async function probeChatGptBranchesInPage() {
   }
 
   try {
-    const data = await fetchChatGptConversation(conversationId);
+    const token = await getAccessToken();
+    const data = await fetchChatGptConversation(conversationId, token);
     const stats = getChatGptBranchStats(data.mapping || {});
+    let fileCount = 0;
+    let fileProbeWarning = null;
+
+    try {
+      fileCount = getChatGptConversationFileCount(await fetchChatGptConversationFiles(conversationId, token));
+    } catch (error) {
+      fileProbeWarning = error && error.message ? error.message : String(error);
+      console.warn("[conversation-exporter] ChatGPT file probe failed", error);
+    }
+
     return {
       ok: true,
       hasBranches: stats.branchPoints > 0,
       branchPoints: stats.branchPoints,
-      branchedChildren: stats.branchedChildren
+      branchedChildren: stats.branchedChildren,
+      hasFiles: fileCount > 0,
+      fileCount,
+      fileProbeWarning
     };
   } catch (error) {
     return {
@@ -342,14 +389,13 @@ async function probeChatGptBranchesInPage() {
     return match ? match[1] : null;
   }
 
-  async function fetchChatGptConversation(convId) {
-    const token = await getAccessToken();
-    const response = await fetch(`${location.origin}/backend-api/conversation/${convId}`, {
+  async function fetchChatGptConversation(convId, token) {
+    const response = await fetchChatGptWithRetry(`${location.origin}/backend-api/conversation/${convId}`, {
       credentials: "include",
       headers: {
         Authorization: `Bearer ${token}`
       }
-    });
+    }, "Conversation");
 
     if (!response.ok) {
       throw new Error(`Conversation request failed with HTTP ${response.status}.`);
@@ -361,6 +407,56 @@ async function probeChatGptBranchesInPage() {
     }
 
     return data;
+  }
+
+  async function fetchChatGptConversationFiles(convId, token) {
+    const response = await fetchChatGptWithRetry(
+      `${location.origin}/backend-api/conversations/${encodeURIComponent(convId)}/files?limit=200`,
+      {
+        credentials: "include",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      },
+      "Files list"
+    );
+
+    const data = await response.json();
+    if (!data || !Array.isArray(data.items)) {
+      throw new Error("Unexpected ChatGPT files response with no items array.");
+    }
+
+    return data;
+  }
+
+  async function fetchChatGptWithRetry(url, init, label) {
+    let lastResponse = null;
+    for (let attempt = 0; attempt <= 10; attempt++) {
+      const response = await fetch(url, init);
+      if (response.ok) return response;
+
+      lastResponse = response;
+      if (response.status !== 429 || attempt >= 10) break;
+      await sleep(getRetryDelayMs(response, attempt));
+    }
+
+    throw new Error(`${label} request failed with HTTP ${lastResponse ? lastResponse.status : "unknown"}.`);
+  }
+
+  function getRetryDelayMs(response, attempt) {
+    const retryAfter = response && response.headers ? response.headers.get("retry-after") : "";
+    const numeric = Number(retryAfter);
+    if (Number.isFinite(numeric) && numeric > 0) return Math.min(Math.max(numeric * 1000, 3000), 20000);
+
+    const parsedDate = Date.parse(retryAfter || "");
+    if (Number.isFinite(parsedDate)) return Math.min(Math.max(parsedDate - Date.now(), 3000), 20000);
+
+    return Math.min(Math.max(3000 * Math.pow(2, attempt), 3000), 20000);
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   async function getAccessToken() {
@@ -404,6 +500,20 @@ async function probeChatGptBranchesInPage() {
     }
 
     return { branchPoints, branchedChildren };
+  }
+
+  function getChatGptConversationFileCount(data) {
+    const seen = new Set();
+    for (const item of Array.isArray(data && data.items) ? data.items : []) {
+      if (!item || typeof item !== "object") continue;
+      const key = item.file_id
+        ? `file-id:${item.file_id}`
+        : item.id
+          ? `library-id:${item.id}`
+          : `meta:${item.file_name || ""}:${item.file_size_bytes || ""}:${item.mime_type || ""}`;
+      if (key !== "meta:::" && !seen.has(key)) seen.add(key);
+    }
+    return seen.size;
   }
 
   function unique(values) {
@@ -478,14 +588,28 @@ async function probeClaudeConversationInPage() {
     try {
       const data = await fetchClaudeConversation(orgId, conversationId);
       const stats = getClaudeBranchStats(data.chat_messages || []);
-      const fileCount = getClaudeDownloadableFileCount(data.chat_messages || [], orgId, conversationId);
+      const seenFiles = new Set();
+      let fileCount = getClaudeDownloadableFileCount(data.chat_messages || [], orgId, conversationId, seenFiles);
+      let fileProbeWarning = null;
+
+      try {
+        fileCount += getClaudeWorkspaceFileCount(
+          await fetchClaudeWiggleFiles(orgId, conversationId),
+          seenFiles
+        );
+      } catch (error) {
+        fileProbeWarning = error && error.message ? error.message : String(error);
+        console.warn("[conversation-exporter] Claude workspace file probe failed", error);
+      }
+
       return {
         ok: true,
         hasBranches: stats.branchPoints > 0,
         branchPoints: stats.branchPoints,
         branchedChildren: stats.branchedChildren,
         hasFiles: fileCount > 0,
-        fileCount
+        fileCount,
+        fileProbeWarning
       };
     } catch (error) {
       lastError = error;
@@ -585,12 +709,12 @@ async function probeClaudeConversationInPage() {
       + `/chat_conversations/${encodeURIComponent(conversationId)}`
       + "?tree=True&rendering_mode=messages&render_all_tools=true&consistency=strong";
 
-    const response = await fetch(url, {
+    const response = await fetchClaudeWithRetry(url, {
       credentials: "include",
       headers: {
         Accept: "application/json"
       }
-    });
+    }, "Conversation");
 
     if (!response.ok) {
       throw new Error(`Conversation request failed with HTTP ${response.status}.`);
@@ -602,6 +726,63 @@ async function probeClaudeConversationInPage() {
     }
 
     return data;
+  }
+
+  async function fetchClaudeWiggleFiles(orgId, conversationId) {
+    const url = `${location.origin}/api/organizations/${encodeURIComponent(orgId)}`
+      + `/conversations/${encodeURIComponent(conversationId)}`
+      + "/wiggle/list-files?prefix=";
+
+    const response = await fetchClaudeWithRetry(url, {
+      credentials: "include",
+      headers: {
+        Accept: "application/json"
+      }
+    }, "Workspace file list");
+
+    const data = await response.json();
+    if (!data || !Array.isArray(data.files)) {
+      throw new Error("Unexpected Claude workspace file list response.");
+    }
+
+    return data;
+  }
+
+  async function fetchClaudeWithRetry(url, init, label) {
+    let lastResponse = null;
+
+    for (let attempt = 0; attempt <= 10; attempt++) {
+      const response = await fetch(url, init);
+      if (response.ok) return response;
+
+      lastResponse = response;
+      if (response.status !== 429 || attempt >= 10) break;
+      await sleep(getClaudeRetryDelayMs(response, attempt));
+    }
+
+    if (lastResponse && lastResponse.status === 429) {
+      const retryAfter = lastResponse.headers && lastResponse.headers.get("retry-after");
+      throw new Error(`${label} request was rate limited by Claude${retryAfter ? `; retry after ${retryAfter}` : ""}.`);
+    }
+
+    throw new Error(`${label} request failed with HTTP ${lastResponse ? lastResponse.status : "unknown"}.`);
+  }
+
+  function getClaudeRetryDelayMs(response, attempt) {
+    const retryAfter = response && response.headers ? response.headers.get("retry-after") : "";
+    const numeric = Number(retryAfter);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return Math.min(Math.max(numeric * 1000, 3000), 20000);
+    }
+
+    const parsedDate = Date.parse(retryAfter || "");
+    if (Number.isFinite(parsedDate)) return Math.min(Math.max(parsedDate - Date.now(), 3000), 20000);
+
+    return Math.min(Math.max(3000 * Math.pow(2, attempt), 3000), 20000);
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   function getClaudeBranchStats(messages) {
@@ -641,8 +822,7 @@ async function probeClaudeConversationInPage() {
     return null;
   }
 
-  function getClaudeDownloadableFileCount(messages, orgId, convId) {
-    const seen = new Set();
+  function getClaudeDownloadableFileCount(messages, orgId, convId, seen) {
     let count = 0;
 
     for (const message of messages) {
@@ -668,6 +848,21 @@ async function probeClaudeConversationInPage() {
         seen.add(key);
         count++;
       }
+    }
+
+    return count;
+  }
+
+  function getClaudeWorkspaceFileCount(listData, seen) {
+    let count = 0;
+
+    for (const path of getArray(listData && listData.files)) {
+      if (typeof path !== "string" || !path) continue;
+
+      const key = `binary:${path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      count++;
     }
 
     return count;

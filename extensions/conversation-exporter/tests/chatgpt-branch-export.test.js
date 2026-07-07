@@ -8,6 +8,12 @@ const extensionRoot = path.resolve(__dirname, "..");
 
 function loadChatGptExporter() {
   const code = fs.readFileSync(path.join(extensionRoot, "exporters", "chatgpt.js"), "utf8");
+  function TestURL(value, base) {
+    return new URL(value, base);
+  }
+  TestURL.createObjectURL = () => "blob:test";
+  TestURL.revokeObjectURL = () => {};
+
   const sandbox = {
     window: { __chatGptBackendExportInProgress: true },
     location: {
@@ -15,13 +21,20 @@ function loadChatGptExporter() {
       origin: "https://chatgpt.com",
       pathname: "/c/00000000-0000-0000-0000-000000000000"
     },
-    document: { title: "Harness" },
-    console,
-    Blob: function Blob() {},
-    URL: {
-      createObjectURL: () => "blob:test",
-      revokeObjectURL: () => {}
+    document: {
+      title: "Harness",
+      body: { appendChild() {} },
+      createElement() {
+        return {
+          click() {},
+          remove() {}
+        };
+      }
     },
+    console,
+    Blob,
+    TextEncoder,
+    URL: TestURL,
     setTimeout,
     fetch: async () => {
       throw new Error("fetch not available in harness");
@@ -48,7 +61,16 @@ function loadClaudeExporter() {
       origin: "https://claude.ai",
       pathname: "/chat/ecc3bc40-8803-488d-a23f-1dbc81a51eb5"
     },
-    document: { title: "Harness" },
+    document: {
+      title: "Harness",
+      body: { appendChild() {} },
+      createElement() {
+        return {
+          click() {},
+          remove() {}
+        };
+      }
+    },
     console,
     Blob,
     TextEncoder,
@@ -359,7 +381,24 @@ test("serialized ChatGPT popup probe is self-contained for page injection", asyn
       if (url === "https://chatgpt.com/backend-api/conversation/00000000-0000-0000-0000-000000000000") {
         return {
           ok: true,
+          status: 200,
+          headers: { get: () => "" },
           json: async () => ({ mapping })
+        };
+      }
+
+      if (url === "https://chatgpt.com/backend-api/conversations/00000000-0000-0000-0000-000000000000/files?limit=200") {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "" },
+          json: async () => ({
+            items: [
+              { id: "lib1", file_id: "file_1", file_name: "one.txt", file_size_bytes: 1 },
+              { id: "lib2", file_id: "file_1", file_name: "one-duplicate.txt", file_size_bytes: 1 },
+              { id: "lib3", file_id: "file_2", file_name: "two.txt", file_size_bytes: 2 }
+            ]
+          })
         };
       }
 
@@ -374,8 +413,268 @@ test("serialized ChatGPT popup probe is self-contained for page injection", asyn
     ok: true,
     hasBranches: true,
     branchPoints: 1,
-    branchedChildren: 2
+    branchedChildren: 2,
+    hasFiles: true,
+    fileCount: 2,
+    fileProbeWarning: null
   });
+});
+
+test("ChatGPT conversation file collector handles backend file list and metadata dedupe", () => {
+  const chatgpt = loadChatGptExporter();
+  const files = chatgpt.collectChatGptConversationFiles({
+    items: [
+      {
+        id: "lib-a",
+        file_id: "file_a",
+        file_name: "notes.md",
+        mime_type: "text/markdown",
+        file_size_bytes: 12
+      },
+      {
+        id: "lib-a-dupe",
+        file_id: "file_a",
+        file_name: "notes-copy.md",
+        mime_type: "text/markdown",
+        file_size_bytes: 12
+      },
+      {
+        id: "lib-b",
+        file_name: "report.json",
+        mime_type: "application/json",
+        file_size_bytes: 20
+      }
+    ]
+  }, "conv-id");
+
+  assert.deepEqual(plain(files.map((file) => file.downloadName)), ["notes.md", "report.json"]);
+  assert.equal(
+    files[0].url,
+    "https://chatgpt.com/backend-api/files/download/file_a?inline=true&download_intent=false&check_context_scopes_for_conversation_id=conv-id"
+  );
+  assert.equal(
+    files[1].url,
+    "https://chatgpt.com/backend-api/files/download/lib-b?inline=true&download_intent=false&check_context_scopes_for_conversation_id=conv-id"
+  );
+});
+
+test("ChatGPT file download uses files endpoint and zips returned bodies", async () => {
+  const chatgpt = loadChatGptExporter();
+  const requested = [];
+
+  chatgpt.fetch = async (url) => {
+    requested.push(String(url));
+
+    if (url === "/api/auth/session") {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({ accessToken: "token" })
+      };
+    }
+
+    if (String(url).includes("/backend-api/conversations/00000000-0000-0000-0000-000000000000/files?limit=200")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({
+          items: [
+            { id: "lib-a", file_id: "file_a", file_name: "a.txt", file_size_bytes: 5 },
+            { id: "lib-b", file_id: "file_b", file_name: "b.txt", file_size_bytes: 4 }
+          ]
+        })
+      };
+    }
+
+    if (String(url).includes("/backend-api/files/download/")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        blob: async () => new Blob([String(url).includes("file_a") ? "alpha" : "beta"], { type: "text/plain" })
+      };
+    }
+
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  const out = await chatgpt.downloadChatGptConversationFiles("00000000-0000-0000-0000-000000000000");
+
+  assert.equal(out.exportMode, "download-files-all");
+  assert.equal(out.counts.files, 2);
+  assert.equal(out.counts.downloaded, 2);
+  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 2);
+  assert.equal(
+    requested.some((url) => url.includes("check_context_scopes_for_conversation_id=00000000-0000-0000-0000-000000000000")),
+    true
+  );
+});
+
+test("ChatGPT file downloader limits concurrent downloads to five", async () => {
+  const chatgpt = loadChatGptExporter();
+  const pending = [];
+  let active = 0;
+  let maxActive = 0;
+  let completed = 0;
+
+  chatgpt.setTimeout = (callback) => {
+    callback();
+    return 0;
+  };
+
+  chatgpt.fetch = async (url) => {
+    if (url === "/api/auth/session") {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({ accessToken: "token" })
+      };
+    }
+
+    if (String(url).includes("/backend-api/conversations/conv/files?limit=200")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({
+          items: Array.from({ length: 8 }, (_, index) => ({
+            id: `lib-${index}`,
+            file_id: `file_${index}`,
+            file_name: `file-${index}.txt`
+          }))
+        })
+      };
+    }
+
+    active++;
+    maxActive = Math.max(maxActive, active);
+
+    return new Promise((resolve) => {
+      pending.push(() => {
+        active--;
+        completed++;
+        resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => "" },
+          blob: async () => new Blob([String(url)], { type: "text/plain" })
+        });
+      });
+    });
+  };
+
+  const downloadPromise = chatgpt.downloadChatGptConversationFiles("conv");
+
+  while (pending.length < 5) await Promise.resolve();
+  assert.equal(maxActive, 5);
+
+  while (completed < 8) {
+    while (!pending.length) await Promise.resolve();
+    pending.shift()();
+    await Promise.resolve();
+  }
+
+  const out = await downloadPromise;
+  assert.equal(out.counts.files, 8);
+  assert.equal(out.counts.downloaded, 8);
+  assert.equal(maxActive, 5);
+});
+
+test("ChatGPT file downloader pauses all workers during shared 429 backoff", async () => {
+  const chatgpt = loadChatGptExporter();
+  const pending = [];
+  const timers = [];
+  const requested = [];
+
+  chatgpt.setTimeout = (callback, delay) => {
+    if (delay === 150) {
+      callback();
+      return 0;
+    }
+    timers.push({ callback, delay });
+    return 0;
+  };
+
+  chatgpt.fetch = async (url) => {
+    requested.push(String(url));
+
+    if (url === "/api/auth/session") {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({ accessToken: "token" })
+      };
+    }
+
+    if (String(url).includes("/backend-api/conversations/conv/files?limit=200")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({
+          items: Array.from({ length: 7 }, (_, index) => ({
+            id: `lib-${index}`,
+            file_id: `file_${index}`,
+            file_name: `file-${index}.txt`
+          }))
+        })
+      };
+    }
+
+    return new Promise((resolve) => {
+      pending.push({ url: String(url), resolve });
+    });
+  };
+
+  const downloadPromise = chatgpt.downloadChatGptConversationFiles("conv");
+
+  while (pending.length < 5) await Promise.resolve();
+  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 5);
+
+  pending.shift().resolve({
+    ok: false,
+    status: 429,
+    headers: { get: () => "" }
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  while (!timers.length) await Promise.resolve();
+  assert.equal(timers[0].delay, 3000);
+
+  while (pending.length) {
+    pending.shift().resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => "" },
+      blob: async () => new Blob(["ok"], { type: "text/plain" })
+    });
+    await Promise.resolve();
+  }
+
+  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 5);
+
+  timers.shift().callback();
+  while (pending.length < 3) await Promise.resolve();
+  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 8);
+
+  while (pending.length) {
+    pending.shift().resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => "" },
+      blob: async () => new Blob(["ok"], { type: "text/plain" })
+    });
+    await Promise.resolve();
+  }
+
+  const out = await downloadPromise;
+  assert.equal(out.counts.files, 7);
+  assert.equal(out.counts.downloaded, 7);
 });
 
 test("Claude downloadable file collector handles current file shapes", () => {
@@ -481,17 +780,300 @@ test("Claude downloadable file collector dedupes repeated branch files", () => {
   assert.deepEqual(plain(files.map((file) => file.downloadName)), ["input.txt", "brief.pdf.txt"]);
 });
 
-test("Claude ZIP writer stores multiple files in one archive", async () => {
+test("Claude workspace file collector includes wiggle list files with preserved ZIP paths", () => {
   const claude = loadClaudeExporter();
+  const files = claude.collectClaudeDownloadableFiles({
+    uuid: "conv",
+    chat_messages: []
+  }, "conv", "org");
+
+  claude.addClaudeWiggleFiles(files, {
+    files: [
+      "/mnt/user-data/uploads/graph-admit-plan.md",
+      "/mnt/user-data/outputs/adjudication-tree/INDEX.md"
+    ],
+    files_metadata: [
+      {
+        path: "/mnt/user-data/uploads/graph-admit-plan.md",
+        size: 123,
+        content_type: "text/markdown",
+        custom_metadata: { filename: "graph-admit-plan.md" }
+      },
+      {
+        path: "/mnt/user-data/outputs/adjudication-tree/INDEX.md",
+        size: 456,
+        content_type: "text/plain",
+        custom_metadata: { filename: "INDEX.md" }
+      }
+    ]
+  }, "conv", "org");
+
+  assert.deepEqual(plain(files.map((file) => file.source)), ["wiggle-list-files", "wiggle-list-files"]);
+  assert.deepEqual(plain(files.map((file) => file.zipPath)), [
+    "uploads/graph-admit-plan.md",
+    "outputs/adjudication-tree/INDEX.md"
+  ]);
+  assert.equal(
+    files[0].url,
+    "https://claude.ai/api/organizations/org/conversations/conv/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Fuploads%2Fgraph-admit-plan.md"
+  );
+});
+
+test("Claude fetch retry uses bounded exponential backoff for 429 responses", async () => {
+  const claude = loadClaudeExporter();
+  const delays = [];
+  let attempts = 0;
+
+  claude.setTimeout = (callback, delay) => {
+    delays.push(delay);
+    callback();
+    return 0;
+  };
+  claude.fetch = async () => {
+    attempts++;
+    return attempts < 3
+      ? {
+        ok: false,
+        status: 429,
+        headers: { get: () => "" }
+      }
+      : {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({ ok: true })
+      };
+  };
+
+  const response = await claude.fetchClaudeWithRetry("https://claude.ai/rate-limited", {}, { label: "File" });
+
+  assert.equal(response.ok, true);
+  assert.equal(attempts, 3);
+  assert.deepEqual(delays, [3000, 6000]);
+  assert.equal(claude.getClaudeRetryDelayMs({ headers: { get: () => "1" } }, 0), 3000);
+  assert.equal(claude.getClaudeRetryDelayMs({ headers: { get: () => "60" } }, 0), 20000);
+});
+
+test("Claude file download does not byte-dedupe distinct metadata records", async () => {
+  const claude = loadClaudeExporter();
+  const requested = [];
+
+  claude.fetch = async (url) => {
+    requested.push(url);
+
+    if (String(url).includes("/wiggle/list-files")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({ success: true, files: [], files_metadata: [] })
+      };
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => "" },
+      blob: async () => new Blob(["same bytes"], { type: "text/plain" })
+    };
+  };
+
+  const out = await claude.downloadClaudeConversationFiles({
+    uuid: "conv",
+    name: "Dedup",
+    chat_messages: [
+      claudeMessage("a1", "assistant", {
+        generated_files: [
+          { id: "one", filename: "one.txt", download_url: "/download/one.txt" },
+          { id: "two", filename: "two.txt", download_url: "/download/two.txt" }
+        ]
+      })
+    ]
+  }, "conv", "org");
+
+  assert.equal(out.counts.files, 2);
+  assert.equal(out.counts.downloaded, 2);
+  assert.equal(out.counts.duplicates, undefined);
+  assert.equal(out.duplicates, undefined);
+  assert.equal(requested.filter((url) => String(url).includes("/download/")).length, 2);
+});
+
+test("Claude file downloader limits concurrent downloads to five", async () => {
+  const claude = loadClaudeExporter();
+  const pending = [];
+  let active = 0;
+  let maxActive = 0;
+  let completed = 0;
+
+  claude.setTimeout = (callback) => {
+    callback();
+    return 0;
+  };
+
+  claude.fetch = async (url) => {
+    if (String(url).includes("/wiggle/list-files")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({ success: true, files: [], files_metadata: [] })
+      };
+    }
+
+    active++;
+    maxActive = Math.max(maxActive, active);
+
+    return new Promise((resolve) => {
+      pending.push(() => {
+        active--;
+        completed++;
+        resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => "" },
+          blob: async () => new Blob([String(url)], { type: "text/plain" })
+        });
+      });
+    });
+  };
+
+  const downloadPromise = claude.downloadClaudeConversationFiles({
+    uuid: "conv",
+    name: "Parallel",
+    chat_messages: [
+      claudeMessage("a1", "assistant", {
+        generated_files: Array.from({ length: 8 }, (_, index) => ({
+          id: `file-${index}`,
+          filename: `file-${index}.txt`,
+          download_url: `/download/file-${index}.txt`
+        }))
+      })
+    ]
+  }, "conv", "org");
+
+  while (pending.length < 5) await Promise.resolve();
+  assert.equal(maxActive, 5);
+
+  while (completed < 8) {
+    while (!pending.length) await Promise.resolve();
+    const next = pending.shift();
+    next();
+    await Promise.resolve();
+  }
+
+  const out = await downloadPromise;
+  assert.equal(out.counts.files, 8);
+  assert.equal(out.counts.downloaded, 8);
+  assert.equal(maxActive, 5);
+});
+
+test("Claude file downloader pauses all workers during shared 429 backoff", async () => {
+  const claude = loadClaudeExporter();
+  const pending = [];
+  const timers = [];
+  const requested = [];
+
+  claude.setTimeout = (callback, delay) => {
+    if (delay === 150) {
+      callback();
+      return 0;
+    }
+    timers.push({ callback, delay });
+    return 0;
+  };
+
+  claude.fetch = async (url) => {
+    requested.push(String(url));
+
+    if (String(url).includes("/wiggle/list-files")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "" },
+        json: async () => ({ success: true, files: [], files_metadata: [] })
+      };
+    }
+
+    return new Promise((resolve) => {
+      pending.push({ url: String(url), resolve });
+    });
+  };
+
+  const downloadPromise = claude.downloadClaudeConversationFiles({
+    uuid: "conv",
+    name: "Backoff",
+    chat_messages: [
+      claudeMessage("a1", "assistant", {
+        generated_files: Array.from({ length: 7 }, (_, index) => ({
+          id: `file-${index}`,
+          filename: `file-${index}.txt`,
+          download_url: `/download/file-${index}.txt`
+        }))
+      })
+    ]
+  }, "conv", "org");
+
+  while (pending.length < 5) await Promise.resolve();
+  assert.equal(requested.filter((url) => url.includes("/download/")).length, 5);
+
+  pending.shift().resolve({
+    ok: false,
+    status: 429,
+    headers: { get: () => "" }
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  while (!timers.length) await Promise.resolve();
+  assert.equal(timers[0].delay, 3000);
+
+  while (pending.length) {
+    pending.shift().resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => "" },
+      blob: async () => new Blob(["ok"], { type: "text/plain" })
+    });
+    await Promise.resolve();
+  }
+
+  assert.equal(requested.filter((url) => url.includes("/download/")).length, 5);
+
+  timers.shift().callback();
+  while (pending.length < 3) await Promise.resolve();
+  assert.equal(requested.filter((url) => url.includes("/download/")).length, 8);
+
+  while (pending.length) {
+    pending.shift().resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => "" },
+      blob: async () => new Blob(["ok"], { type: "text/plain" })
+    });
+    await Promise.resolve();
+  }
+
+  const out = await downloadPromise;
+  assert.equal(out.counts.files, 7);
+  assert.equal(out.counts.downloaded, 7);
+});
+
+test("Claude ZIP writer stores byte-part entries in one archive", async () => {
+  const claude = loadClaudeExporter();
+  const encoder = new TextEncoder();
   const zip = await claude.createZipBlob([
     {
       name: "first.txt",
-      blob: new Blob(["alpha"], { type: "text/plain" }),
+      parts: [encoder.encode("alpha")],
+      size: 5,
+      crc: claude.crc32(encoder.encode("alpha")),
       lastModified: new Date("2026-01-01T00:00:00Z")
     },
     {
-      name: "second.json",
-      blob: new Blob(['{"ok":true}'], { type: "application/json" }),
+      name: "outputs/report/second.json",
+      parts: [encoder.encode('{"ok":true}')],
+      size: 11,
+      crc: claude.crc32(encoder.encode('{"ok":true}')),
       lastModified: new Date("2026-01-01T00:00:00Z")
     }
   ]);
@@ -502,7 +1084,7 @@ test("Claude ZIP writer stores multiple files in one archive", async () => {
   assert.equal(zip.type, "application/zip");
   assert.equal(new DataView(bytes.buffer).getUint32(0, true), 0x04034b50);
   assert.match(text, /first\.txt/);
-  assert.match(text, /second\.json/);
+  assert.match(text, /outputs\/report\/second\.json/);
   assert.match(text, /alpha/);
   assert.match(text, /\{"ok":true\}/);
 });
