@@ -2,8 +2,10 @@ const CHATGPT_CONVERSATION_PATH_RE = /(?:^|\/)c\/[0-9a-f-]{36}(?:\/|$)/i;
 const CLAUDE_ID_RE = /^[0-9a-f-]{16,}$/i;
 const CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
 const CHATGPT_EXPORT_MODE_ALL = "all-branches";
+const CHATGPT_EXPORT_MODE_BACKEND_CURRENT = "backend-current";
 const CLAUDE_EXPORT_MODE_CURRENT = "current-branch";
 const CLAUDE_EXPORT_MODE_ALL = "all-branches";
+const CLAUDE_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
 
 const buttonArea = document.getElementById("buttonArea");
 const statusEl = document.getElementById("status");
@@ -83,6 +85,7 @@ function renderButtons(buttons) {
     button.type = "button";
     button.textContent = config.label;
     button.disabled = Boolean(config.disabled);
+    button.dataset.defaultDisabled = config.disabled ? "true" : "false";
     if (config.variant) button.dataset.variant = config.variant;
     if (config.onClick) button.addEventListener("click", config.onClick);
     buttonArea.appendChild(button);
@@ -91,7 +94,7 @@ function renderButtons(buttons) {
 
 function setButtonsDisabled(disabled) {
   buttonArea.querySelectorAll("button").forEach((button) => {
-    button.disabled = disabled;
+    button.disabled = disabled || button.dataset.defaultDisabled === "true";
   });
 }
 
@@ -160,31 +163,42 @@ async function initializeChatGptButtons(tab, target) {
     return;
   }
 
-  renderButtons([{
-    label: "Export conversation",
-    onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_CURRENT)
-  }]);
-
   if (probe && probe.ok) {
+    renderButtons([{
+      label: "Export conversation",
+      onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_BACKEND_CURRENT)
+    }]);
     setStatus("Ready.");
   } else {
+    renderButtons([{
+      label: "Export conversation",
+      onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_CURRENT)
+    }]);
     setStatus("Ready. Branch detection unavailable.");
   }
 }
 
 async function initializeClaudeButtons(tab, target) {
-  setStatus("Checking Claude branches...");
+  setStatus("Checking Claude conversation...");
   renderDisabledButton();
 
   let probe = null;
   try {
     probe = getResult(await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: probeClaudeBranchesInPage
+      func: probeClaudeConversationInPage
     }));
   } catch (error) {
-    console.warn("[conversation-exporter] Claude branch probe failed", error);
+    console.warn("[conversation-exporter] Claude probe failed", error);
   }
+
+  const fileCount = probe && probe.ok && Number.isFinite(probe.fileCount) ? probe.fileCount : 0;
+  const downloadFilesButton = {
+    label: fileCount ? `Download all files (${fileCount})` : "Download all files",
+    variant: "secondary",
+    disabled: fileCount <= 0,
+    onClick: fileCount > 0 ? () => runExport(tab, target, CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) : null
+  };
 
   if (probe && probe.ok && probe.hasBranches) {
     renderButtons([
@@ -196,21 +210,25 @@ async function initializeClaudeButtons(tab, target) {
         label: "Export all branches",
         variant: "secondary",
         onClick: () => runExport(tab, target, CLAUDE_EXPORT_MODE_ALL)
-      }
+      },
+      downloadFilesButton
     ]);
-    setStatus(`Ready. Found ${probe.branchPoints} branch ${probe.branchPoints === 1 ? "point" : "points"}.`);
+    setStatus(formatClaudeReadyStatus(probe));
     return;
   }
 
-  renderButtons([{
-    label: "Export conversation",
-    onClick: () => runExport(tab, target, CLAUDE_EXPORT_MODE_CURRENT)
-  }]);
+  renderButtons([
+    {
+      label: "Export conversation",
+      onClick: () => runExport(tab, target, CLAUDE_EXPORT_MODE_CURRENT)
+    },
+    downloadFilesButton
+  ]);
 
   if (probe && probe.ok) {
-    setStatus("Ready.");
+    setStatus(formatClaudeReadyStatus(probe));
   } else {
-    setStatus("Ready. Branch detection unavailable.");
+    setStatus("Ready. Claude API probe unavailable.");
   }
 }
 
@@ -263,6 +281,15 @@ function setClaudeExportModeInPage(mode) {
 
 function formatSuccessStatus(result) {
   const counts = result.counts || {};
+
+  if (result.exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
+    const fileCount = Number.isFinite(counts.files) ? counts.files : 0;
+    const downloaded = Number.isFinite(counts.downloaded) ? counts.downloaded : fileCount;
+    const failed = Number.isFinite(counts.failed) ? counts.failed : 0;
+    const failureNote = failed ? ` (${failed} failed)` : "";
+    return `Downloaded ${downloaded} of ${fileCount} files${failureNote}.`;
+  }
+
   const messageCount = Number.isFinite(counts.messages) ? counts.messages : 0;
   const fileCount = Number.isFinite(counts.files) ? counts.files : 0;
   const fallbackNote = result.source === "claude-dom-fallback" ? " visible" : "";
@@ -271,6 +298,20 @@ function formatSuccessStatus(result) {
     : "";
 
   return `Downloaded ${messageCount}${fallbackNote} messages${branchNote} (${fileCount} files listed).`;
+}
+
+function formatClaudeReadyStatus(probe) {
+  const parts = ["Ready."];
+
+  if (probe.branchPoints > 0) {
+    parts.push(`Found ${probe.branchPoints} branch ${probe.branchPoints === 1 ? "point" : "points"}.`);
+  }
+
+  if (probe.fileCount > 0) {
+    parts.push(`Found ${probe.fileCount} downloadable ${probe.fileCount === 1 ? "file" : "files"}.`);
+  }
+
+  return parts.join(" ");
 }
 
 async function probeChatGptBranchesInPage() {
@@ -423,7 +464,7 @@ function unique(values) {
   return out;
 }
 
-async function probeClaudeBranchesInPage() {
+async function probeClaudeConversationInPage() {
   const rootParentUuid = "00000000-0000-4000-8000-000000000000";
   const conversationId = getConversationId();
   if (!conversationId) {
@@ -437,11 +478,14 @@ async function probeClaudeBranchesInPage() {
     try {
       const data = await fetchClaudeConversation(orgId, conversationId);
       const stats = getClaudeBranchStats(data.chat_messages || []);
+      const fileCount = getClaudeDownloadableFileCount(data.chat_messages || [], orgId, conversationId);
       return {
         ok: true,
         hasBranches: stats.branchPoints > 0,
         branchPoints: stats.branchPoints,
-        branchedChildren: stats.branchedChildren
+        branchedChildren: stats.branchedChildren,
+        hasFiles: fileCount > 0,
+        fileCount
       };
     } catch (error) {
       lastError = error;
@@ -595,6 +639,85 @@ async function probeClaudeBranchesInPage() {
     if (sender === "human" || sender === "user") return "user";
     if (sender === "assistant" || sender === "claude") return "assistant";
     return null;
+  }
+
+  function getClaudeDownloadableFileCount(messages, orgId, convId) {
+    const seen = new Set();
+    let count = 0;
+
+    for (const message of messages) {
+      if (!message || typeof message !== "object") continue;
+
+      const candidates = []
+        .concat(getArray(message.attachments).map((file) => ({ file, source: "attachment" })))
+        .concat(getArray(message.files).map((file) => ({ file, source: "files" })))
+        .concat(getArray(message.files_v2).map((file) => ({ file, source: "files_v2" })))
+        .concat(getArray(message.generated_files).map((file) => ({ file, source: "generated_files" })));
+
+      for (const candidate of candidates) {
+        const key = getClaudeFileKey(candidate.file, candidate.source);
+        if (!key || seen.has(key)) continue;
+        if (!hasClaudeDownloadMethod(candidate.file, candidate.source, orgId, convId)) continue;
+        seen.add(key);
+        count++;
+      }
+
+      for (const artifact of getClaudeArtifactContentFiles(message)) {
+        const key = `artifact:${artifact.id}:${artifact.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        count++;
+      }
+    }
+
+    return count;
+  }
+
+  function getArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function getClaudeFileKey(file, source) {
+    if (!file || typeof file !== "object") return "";
+    const id = file.file_uuid || file.uuid || file.id || file.file_id || file.path || file.url || file.preview_url || "";
+    const name = file.file_name || file.name || file.filename || "";
+
+    if (source === "attachment" && typeof file.extracted_content === "string") {
+      return `attachment:${id}:${name}`;
+    }
+
+    return id ? `binary:${id}` : `${source}:${name}`;
+  }
+
+  function hasClaudeDownloadMethod(file, source, orgId, convId) {
+    if (!file || typeof file !== "object") return false;
+    if (source === "attachment" && typeof file.extracted_content === "string") return true;
+    if (file.url || file.download_url || file.downloadUrl || file.preview_url || (file.document_asset && file.document_asset.url)) {
+      return true;
+    }
+    if (source === "files_v2" && file.path && orgId && convId) return true;
+    if (file.file_kind === "blob" && file.file_uuid && orgId) return true;
+    return Boolean(file.file_uuid && orgId && (file.file_name || file.name || file.filename));
+  }
+
+  function getClaudeArtifactContentFiles(message) {
+    const out = [];
+
+    for (const block of getArray(message.content)) {
+      if (!block || typeof block !== "object") continue;
+      const input = block.input && typeof block.input === "object" ? block.input : null;
+      if (!input) continue;
+
+      if (block.type === "tool_use" && (block.name === "artifacts" || block.name === "create_file") && typeof input.content === "string") {
+        out.push({
+          id: block.id || input.id || input.filename || input.title || "",
+          name: input.filename || input.title || "artifact",
+          content: input.content
+        });
+      }
+    }
+
+    return out;
   }
 }
 

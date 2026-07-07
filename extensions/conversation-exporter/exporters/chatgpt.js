@@ -1,5 +1,6 @@
 var CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
 var CHATGPT_EXPORT_MODE_ALL = "all-branches";
+var CHATGPT_EXPORT_MODE_BACKEND_CURRENT = "backend-current";
 var CHATGPT_BRANCH_STRUCTURE = "segment-tree";
 
 (async () => {
@@ -36,6 +37,7 @@ var CHATGPT_BRANCH_STRUCTURE = "segment-tree";
 })();
 
 function normalizeChatGptExportMode(mode) {
+  if (mode === CHATGPT_EXPORT_MODE_BACKEND_CURRENT) return CHATGPT_EXPORT_MODE_BACKEND_CURRENT;
   return mode === CHATGPT_EXPORT_MODE_ALL ? CHATGPT_EXPORT_MODE_ALL : CHATGPT_EXPORT_MODE_CURRENT;
 }
 
@@ -86,7 +88,12 @@ async function fetchChatGptConversation(convId) {
 }
 
 async function buildChatGptCurrentBranchExport(conv, convId) {
-  const branch = await getRenderedBranchOrder(conv.mapping, conv.current_node);
+  const branch = window.__chatGptExportMode === CHATGPT_EXPORT_MODE_BACKEND_CURRENT
+    ? {
+        order: getActiveBranchOrder(conv.mapping, conv.current_node),
+        source: "backend-current-node"
+      }
+    : await getRenderedBranchOrder(conv.mapping, conv.current_node);
   const segment = buildMessages(branch.order, conv.mapping, null);
 
   return {

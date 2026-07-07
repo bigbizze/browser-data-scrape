@@ -1,5 +1,6 @@
 var CLAUDE_EXPORT_MODE_CURRENT = "current-branch";
 var CLAUDE_EXPORT_MODE_ALL = "all-branches";
+var CLAUDE_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
 var CLAUDE_BRANCH_STRUCTURE = "segment-tree";
 var CLAUDE_ROOT_PARENT_UUID = "00000000-0000-4000-8000-000000000000";
 
@@ -22,7 +23,8 @@ var CLAUDE_ROOT_PARENT_UUID = "00000000-0000-4000-8000-000000000000";
       exportMode: out.exportMode || exportMode,
       counts: out.totalCounts || out.counts,
       conversationId: out.conversationId,
-      downloadName: out.downloadName
+      downloadName: out.downloadName,
+      failures: out.failures || []
     };
   } catch (error) {
     console.error("[claude-export] FAILED", error);
@@ -37,6 +39,7 @@ var CLAUDE_ROOT_PARENT_UUID = "00000000-0000-4000-8000-000000000000";
 })();
 
 function normalizeClaudeExportMode(mode) {
+  if (mode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) return CLAUDE_EXPORT_MODE_DOWNLOAD_FILES;
   return mode === CLAUDE_EXPORT_MODE_ALL ? CLAUDE_EXPORT_MODE_ALL : CLAUDE_EXPORT_MODE_CURRENT;
 }
 
@@ -52,6 +55,10 @@ async function exportClaudeConversation(exportMode) {
   for (const orgId of orgIds) {
     try {
       const data = await fetchClaudeConversation(orgId, conversationId);
+      if (exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
+        return downloadClaudeConversationFiles(data, conversationId, orgId);
+      }
+
       const out = exportMode === CLAUDE_EXPORT_MODE_ALL
         ? buildClaudeAllBranchesExport(data, conversationId, orgId)
         : buildClaudeCurrentBranchExport(data, conversationId, orgId);
@@ -69,6 +76,11 @@ async function exportClaudeConversation(exportMode) {
   if (exportMode === CLAUDE_EXPORT_MODE_ALL) {
     const reason = apiError && apiError.message ? ` Last API error: ${apiError.message}` : "";
     throw new Error(`Claude API all-branches export failed.${reason}`);
+  }
+
+  if (exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
+    const reason = apiError && apiError.message ? ` Last API error: ${apiError.message}` : "";
+    throw new Error(`Claude file discovery failed.${reason}`);
   }
 
   const fallback = buildClaudeDomFallbackExport(conversationId, apiError);
@@ -185,6 +197,499 @@ async function fetchClaudeConversation(orgId, conversationId) {
   }
 
   return data;
+}
+
+async function downloadClaudeConversationFiles(data, conversationId, orgId) {
+  const files = collectClaudeDownloadableFiles(data, conversationId, orgId);
+  if (!files.length) {
+    throw new Error("No downloadable Claude files found in this conversation.");
+  }
+
+  const results = [];
+  for (const file of files) {
+    try {
+      const download = await fetchClaudeDownloadBlob(file);
+      results.push({ file, ok: true, blob: download.blob, downloadName: download.name });
+      await sleep(150);
+    } catch (error) {
+      console.warn("[claude-export] File download failed", file, error);
+      results.push({
+        file,
+        ok: false,
+        error: error && error.message ? error.message : String(error)
+      });
+    }
+  }
+
+  const failures = results.filter((result) => !result.ok);
+  const downloaded = results.length - failures.length;
+  if (!downloaded && failures.length) {
+    throw new Error(`Failed to download ${failures.length} Claude files. First error: ${failures[0].error}`);
+  }
+
+  const successful = results.filter((result) => result.ok);
+  const archiveName = makeClaudeFilesArchiveName(data, conversationId);
+  const downloadedName = await downloadClaudeFileResults(successful, archiveName);
+
+  const out = {
+    exportedAt: new Date().toISOString(),
+    source: "claude-api-files",
+    exportMode: CLAUDE_EXPORT_MODE_DOWNLOAD_FILES,
+    url: location.href,
+    conversationId: data.uuid || conversationId,
+    organizationId: orgId,
+    title: data.name || document.title || "Claude conversation",
+    counts: {
+      messages: Array.isArray(data.chat_messages) ? data.chat_messages.length : 0,
+      files: files.length,
+      downloaded,
+      failed: failures.length
+    },
+    downloadName: downloadedName,
+    files,
+    failures
+  };
+
+  window.__lastClaudeFileDownload = out;
+  console.log("[claude-export] FILE DOWNLOAD DONE", out.counts);
+  return out;
+}
+
+async function downloadClaudeFileResults(results, archiveName) {
+  if (results.length === 1) {
+    downloadBlob(results[0].blob, results[0].downloadName);
+    return results[0].downloadName;
+  }
+
+  const entries = results.map((result) => ({
+    name: result.downloadName,
+    blob: result.blob,
+    lastModified: new Date()
+  }));
+  const zipBlob = await createZipBlob(entries);
+  downloadBlob(zipBlob, archiveName);
+  return archiveName;
+}
+
+function makeClaudeFilesArchiveName(data, conversationId) {
+  const title = sanitizeDownloadName(data.name || document.title || "claude-files")
+    .replace(/\.[^.]+$/, "");
+  const id = String(data.uuid || conversationId || "conversation").slice(0, 8);
+  return sanitizeDownloadName(`${title || "claude-files"}-${id}-files.zip`);
+}
+
+function collectClaudeDownloadableFiles(data, conversationId, orgId) {
+  const messages = Array.isArray(data && data.chat_messages) ? data.chat_messages : [];
+  const files = [];
+  const seen = new Set();
+
+  messages.forEach((message, messageIndex) => {
+    if (!message || typeof message !== "object") return;
+
+    const owner = normalizeClaudeRole(message.sender) || "unknown";
+    const add = (file, source) => {
+      const normalized = normalizeClaudeDownloadableFile(file, message, messageIndex, owner, source, conversationId, orgId);
+      if (!normalized) return;
+
+      const key = getClaudeDownloadFileKey(normalized);
+      if (seen.has(key)) return;
+      seen.add(key);
+      files.push(normalized);
+    };
+
+    for (const attachment of message.attachments || []) add(attachment, "attachment");
+    for (const file of message.files || []) add(file, "files");
+    for (const file of message.files_v2 || []) add(file, "files_v2");
+    for (const file of message.generated_files || []) add(file, "generated_files");
+
+    for (const artifact of getClaudeArtifactDownloadFiles(message, messageIndex, owner)) {
+      const key = getClaudeDownloadFileKey(artifact);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      files.push(artifact);
+    }
+  });
+
+  applyUniqueDownloadNames(files);
+  return files;
+}
+
+function normalizeClaudeDownloadableFile(file, message, messageIndex, owner, source, conversationId, orgId) {
+  if (!file || typeof file !== "object") return null;
+
+  const id = getClaudeFileId(file);
+  const rawName = getClaudeFileName(file, id);
+  const mime = file.mime_type || file.file_type || file.type || "";
+  const textContent = source === "attachment" && typeof file.extracted_content === "string"
+    ? file.extracted_content
+    : null;
+  const url = textContent === null ? getClaudeDownloadUrl(file, source, conversationId, orgId, rawName) : "";
+
+  if (textContent === null && !url) return null;
+
+  const name = textContent === null
+    ? sanitizeDownloadName(rawName || id || "claude-file")
+    : ensureTextDownloadName(rawName || id || "claude-attachment");
+
+  const out = {
+    messageIndex,
+    messageId: message.uuid || null,
+    owner,
+    id,
+    name,
+    downloadName: name,
+    mime: textContent === null ? mime : "text/plain;charset=utf-8",
+    size: file.file_size || file.size || null,
+    kind: textContent === null ? inferFileKind(name, mime) : "document",
+    source,
+    url
+  };
+
+  if (textContent !== null) out.content = textContent;
+  return out;
+}
+
+function getClaudeArtifactDownloadFiles(message, messageIndex, owner) {
+  const out = [];
+  const content = Array.isArray(message.content) ? message.content : [];
+
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const input = block.input && typeof block.input === "object" ? block.input : null;
+    if (!input || typeof input.content !== "string") continue;
+    if (block.type !== "tool_use" || (block.name !== "artifacts" && block.name !== "create_file")) continue;
+
+    const rawName = inferClaudeArtifactFileName(input);
+    out.push({
+      messageIndex,
+      messageId: message.uuid || null,
+      owner,
+      id: block.id || input.id || input.filename || input.title || rawName,
+      name: rawName,
+      downloadName: sanitizeDownloadName(rawName),
+      mime: inferClaudeArtifactMime(input),
+      size: input.content.length,
+      kind: "document",
+      source: block.name === "create_file" ? "artifact-create-file" : "artifact",
+      url: "",
+      content: input.content
+    });
+  }
+
+  return out;
+}
+
+function getClaudeFileId(file) {
+  return String(
+    file.file_uuid
+      || file.uuid
+      || file.id
+      || file.file_id
+      || file.path
+      || file.url
+      || file.preview_url
+      || ""
+  );
+}
+
+function getClaudeFileName(file, id) {
+  const pathName = file.path ? String(file.path).split("/").filter(Boolean).pop() : "";
+  return file.file_name || file.name || file.filename || pathName || id || "claude-file";
+}
+
+function getClaudeDownloadUrl(file, source, conversationId, orgId, name) {
+  const direct = file.download_url
+    || file.downloadUrl
+    || file.url
+    || file.preview_url
+    || (file.document_asset && file.document_asset.url);
+
+  if (direct) return absolutizeClaudeUrl(direct);
+
+  if (source === "files_v2" && file.path && orgId && conversationId) {
+    return `${location.origin}/api/organizations/${encodeURIComponent(orgId)}`
+      + `/conversations/${encodeURIComponent(conversationId)}`
+      + `/wiggle/download-file?path=${encodeURIComponent(file.path)}`;
+  }
+
+  if (file.file_kind === "blob" && file.file_uuid && orgId) {
+    return `${location.origin}/api/organizations/${encodeURIComponent(orgId)}`
+      + `/files/${encodeURIComponent(file.file_uuid)}/contents`;
+  }
+
+  if (file.file_uuid && orgId && name) {
+    const extension = getFileExtension(name);
+    if (extension) {
+      return `${location.origin}/api/${encodeURIComponent(orgId)}`
+        + `/files/${encodeURIComponent(file.file_uuid)}`
+        + `/document_${encodeURIComponent(extension)}`
+        + `/${encodeURIComponent(name)}`;
+    }
+  }
+
+  return "";
+}
+
+function absolutizeClaudeUrl(url) {
+  try {
+    return new URL(url, location.origin).href;
+  } catch (error) {
+    return String(url || "");
+  }
+}
+
+function getClaudeDownloadFileKey(file) {
+  if (file.content !== undefined) {
+    if (String(file.source || "").startsWith("artifact")) {
+      return `${file.source}:content:${file.id}:${file.name}:${file.messageId || ""}`;
+    }
+
+    return `${file.source}:content:${file.id}:${file.name}`;
+  }
+
+  return file.id
+    ? `binary:${file.id}`
+    : `binary:${file.url}:${file.name}`;
+}
+
+function applyUniqueDownloadNames(files) {
+  const used = new Map();
+
+  for (const file of files) {
+    const name = sanitizeDownloadName(file.downloadName || file.name || "claude-file");
+    const key = name.toLowerCase();
+    const count = used.get(key) || 0;
+    used.set(key, count + 1);
+    file.downloadName = count ? addFileNameSuffix(name, count + 1) : name;
+  }
+}
+
+function addFileNameSuffix(name, suffix) {
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex > 0) {
+    return `${name.slice(0, dotIndex)} (${suffix})${name.slice(dotIndex)}`;
+  }
+
+  return `${name} (${suffix})`;
+}
+
+function ensureTextDownloadName(name) {
+  const clean = sanitizeDownloadName(name || "claude-attachment");
+  return /\.txt$/i.test(clean) ? clean : `${clean}.txt`;
+}
+
+function sanitizeDownloadName(name) {
+  const baseName = String(name || "claude-file")
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop() || "claude-file";
+
+  return baseName
+    .replace(/[\x00-\x1f\x7f<>:"/\\|?*]+/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^\.+$/, "claude-file")
+    || "claude-file";
+}
+
+function getFileExtension(name) {
+  const clean = String(name || "");
+  const dotIndex = clean.lastIndexOf(".");
+  if (dotIndex < 0 || dotIndex === clean.length - 1) return "";
+  return clean.slice(dotIndex + 1).toLowerCase();
+}
+
+function inferClaudeArtifactFileName(input) {
+  const existing = input.filename || input.file_name || input.title || "artifact";
+  if (getFileExtension(existing)) return sanitizeDownloadName(existing);
+
+  const language = String(input.language || input.artifact_type || input.type || "").toLowerCase();
+  const extensionByLanguage = {
+    javascript: "js",
+    typescript: "ts",
+    python: "py",
+    html: "html",
+    css: "css",
+    json: "json",
+    markdown: "md",
+    "text/markdown": "md",
+    "text/html": "html",
+    "application/json": "json"
+  };
+  const extension = extensionByLanguage[language] || "txt";
+  return sanitizeDownloadName(`${existing}.${extension}`);
+}
+
+function inferClaudeArtifactMime(input) {
+  const type = input.artifact_type || input.type || "";
+  if (typeof type === "string" && type.includes("/")) return type;
+  return "text/plain;charset=utf-8";
+}
+
+async function fetchClaudeDownloadBlob(file) {
+  if (file.content !== undefined) {
+    return {
+      blob: new Blob([String(file.content)], { type: file.mime || "text/plain;charset=utf-8" }),
+      name: file.downloadName
+    };
+  }
+
+  const response = await fetch(file.url, {
+    credentials: "include",
+    headers: {
+      Accept: "*/*"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`File request failed with HTTP ${response.status}.`);
+  }
+
+  const blob = await response.blob();
+  const headerName = getFilenameFromContentDisposition(response.headers.get("content-disposition"));
+  return {
+    blob,
+    name: sanitizeDownloadName(headerName || file.downloadName || file.name)
+  };
+}
+
+function getFilenameFromContentDisposition(value) {
+  const header = String(value || "");
+  const encoded = header.match(/filename\*=([^']*)''([^;]+)/i);
+  if (encoded && encoded[2]) {
+    try {
+      return decodeURIComponent(encoded[2].replace(/^"|"$/g, ""));
+    } catch (error) {
+      return encoded[2].replace(/^"|"$/g, "");
+    }
+  }
+
+  const plain = header.match(/filename="?([^";]+)"?/i);
+  return plain && plain[1] ? plain[1].trim() : "";
+}
+
+function downloadBlob(blob, downloadName) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = downloadName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+async function createZipBlob(entries) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const bytes = new Uint8Array(await entry.blob.arrayBuffer());
+    const nameBytes = new TextEncoder().encode(sanitizeZipEntryName(entry.name));
+    const crc = crc32(bytes);
+    const time = getZipDosTime(entry.lastModified || new Date());
+    const date = getZipDosDate(entry.lastModified || new Date());
+
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const localView = new DataView(localHeader.buffer);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint16(6, 0x0800, true);
+    localView.setUint16(8, 0, true);
+    localView.setUint16(10, time, true);
+    localView.setUint16(12, date, true);
+    localView.setUint32(14, crc, true);
+    localView.setUint32(18, bytes.length, true);
+    localView.setUint32(22, bytes.length, true);
+    localView.setUint16(26, nameBytes.length, true);
+    localView.setUint16(28, 0, true);
+    localHeader.set(nameBytes, 30);
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const centralView = new DataView(centralHeader.buffer);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, 20, true);
+    centralView.setUint16(6, 20, true);
+    centralView.setUint16(8, 0x0800, true);
+    centralView.setUint16(10, 0, true);
+    centralView.setUint16(12, time, true);
+    centralView.setUint16(14, date, true);
+    centralView.setUint32(16, crc, true);
+    centralView.setUint32(20, bytes.length, true);
+    centralView.setUint32(24, bytes.length, true);
+    centralView.setUint16(28, nameBytes.length, true);
+    centralView.setUint16(30, 0, true);
+    centralView.setUint16(32, 0, true);
+    centralView.setUint16(34, 0, true);
+    centralView.setUint16(36, 0, true);
+    centralView.setUint32(38, 0, true);
+    centralView.setUint32(42, offset, true);
+    centralHeader.set(nameBytes, 46);
+
+    localParts.push(localHeader, bytes);
+    centralParts.push(centralHeader);
+    offset += localHeader.length + bytes.length;
+  }
+
+  const centralOffset = offset;
+  const centralSize = centralParts.reduce((total, part) => total + part.length, 0);
+  const endRecord = new Uint8Array(22);
+  const endView = new DataView(endRecord.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(4, 0, true);
+  endView.setUint16(6, 0, true);
+  endView.setUint16(8, entries.length, true);
+  endView.setUint16(10, entries.length, true);
+  endView.setUint32(12, centralSize, true);
+  endView.setUint32(16, centralOffset, true);
+  endView.setUint16(20, 0, true);
+
+  return new Blob([...localParts, ...centralParts, endRecord], { type: "application/zip" });
+}
+
+function sanitizeZipEntryName(name) {
+  return sanitizeDownloadName(name).replace(/^\/+/, "") || "claude-file";
+}
+
+function getZipDosTime(date) {
+  return (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+}
+
+function getZipDosDate(date) {
+  return ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+
+  for (let index = 0; index < bytes.length; index++) {
+    crc = (crc >>> 8) ^ getCrc32Table()[(crc ^ bytes[index]) & 0xff];
+  }
+
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function getCrc32Table() {
+  if (window.__claudeExportCrc32Table) return window.__claudeExportCrc32Table;
+
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index++) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit++) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    table[index] = value >>> 0;
+  }
+
+  window.__claudeExportCrc32Table = table;
+  return table;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildClaudeCurrentBranchExport(data, conversationId, orgId) {
@@ -723,8 +1228,16 @@ function getClaudeMessageFiles(message, messageIndex, owner, branchPath) {
     out.push(normalizeClaudeFile(attachment, message, messageIndex, owner, "attachment", branchPath));
   }
 
+  for (const file of message.files || []) {
+    out.push(normalizeClaudeFile(file, message, messageIndex, owner, "files", branchPath));
+  }
+
   for (const file of message.files_v2 || []) {
     out.push(normalizeClaudeFile(file, message, messageIndex, owner, "files_v2", branchPath));
+  }
+
+  for (const file of message.generated_files || []) {
+    out.push(normalizeClaudeFile(file, message, messageIndex, owner, "generated_files", branchPath));
   }
 
   return dedupeFiles(out);
@@ -753,6 +1266,11 @@ function normalizeClaudeFile(file, message, messageIndex, owner, source, branchP
     kind: inferFileKind(name, mime),
     source
   };
+
+  if (file.file_uuid) out.fileUuid = file.file_uuid;
+  if (file.path) out.path = file.path;
+  if (file.preview_url) out.previewUrl = file.preview_url;
+  if (file.document_asset && file.document_asset.url) out.documentAssetUrl = file.document_asset.url;
 
   if (Array.isArray(branchPath)) {
     out.branchPath = branchPath.slice();
