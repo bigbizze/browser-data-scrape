@@ -3,7 +3,7 @@ var CHATGPT_EXPORT_MODE_ALL = "all-branches";
 var CHATGPT_EXPORT_MODE_BACKEND_CURRENT = "backend-current";
 var CHATGPT_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
 var CHATGPT_BRANCH_STRUCTURE = "segment-tree";
-var CHATGPT_FILE_DOWNLOAD_CONCURRENCY = 5;
+var CHATGPT_FILE_DOWNLOAD_CONCURRENCY = 10;
 
 (async () => {
   if (window.__chatGptBackendExportInProgress) {

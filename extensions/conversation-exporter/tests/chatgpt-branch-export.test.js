@@ -512,7 +512,7 @@ test("ChatGPT file download uses files endpoint and zips returned bodies", async
   );
 });
 
-test("ChatGPT file downloader limits concurrent downloads to five", async () => {
+test("ChatGPT file downloader limits concurrent downloads to ten", async () => {
   const chatgpt = loadChatGptExporter();
   const pending = [];
   let active = 0;
@@ -540,7 +540,7 @@ test("ChatGPT file downloader limits concurrent downloads to five", async () => 
         status: 200,
         headers: { get: () => "" },
         json: async () => ({
-          items: Array.from({ length: 8 }, (_, index) => ({
+          items: Array.from({ length: 12 }, (_, index) => ({
             id: `lib-${index}`,
             file_id: `file_${index}`,
             file_name: `file-${index}.txt`
@@ -568,19 +568,19 @@ test("ChatGPT file downloader limits concurrent downloads to five", async () => 
 
   const downloadPromise = chatgpt.downloadChatGptConversationFiles("conv");
 
-  while (pending.length < 5) await Promise.resolve();
-  assert.equal(maxActive, 5);
+  while (pending.length < 10) await Promise.resolve();
+  assert.equal(maxActive, 10);
 
-  while (completed < 8) {
+  while (completed < 12) {
     while (!pending.length) await Promise.resolve();
     pending.shift()();
     await Promise.resolve();
   }
 
   const out = await downloadPromise;
-  assert.equal(out.counts.files, 8);
-  assert.equal(out.counts.downloaded, 8);
-  assert.equal(maxActive, 5);
+  assert.equal(out.counts.files, 12);
+  assert.equal(out.counts.downloaded, 12);
+  assert.equal(maxActive, 10);
 });
 
 test("ChatGPT file downloader pauses all workers during shared 429 backoff", async () => {
@@ -616,7 +616,7 @@ test("ChatGPT file downloader pauses all workers during shared 429 backoff", asy
         status: 200,
         headers: { get: () => "" },
         json: async () => ({
-          items: Array.from({ length: 7 }, (_, index) => ({
+          items: Array.from({ length: 12 }, (_, index) => ({
             id: `lib-${index}`,
             file_id: `file_${index}`,
             file_name: `file-${index}.txt`
@@ -632,8 +632,8 @@ test("ChatGPT file downloader pauses all workers during shared 429 backoff", asy
 
   const downloadPromise = chatgpt.downloadChatGptConversationFiles("conv");
 
-  while (pending.length < 5) await Promise.resolve();
-  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 5);
+  while (pending.length < 10) await Promise.resolve();
+  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 10);
 
   pending.shift().resolve({
     ok: false,
@@ -656,11 +656,11 @@ test("ChatGPT file downloader pauses all workers during shared 429 backoff", asy
     await Promise.resolve();
   }
 
-  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 5);
+  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 10);
 
   timers.shift().callback();
   while (pending.length < 3) await Promise.resolve();
-  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 8);
+  assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 13);
 
   while (pending.length) {
     pending.shift().resolve({
@@ -673,8 +673,8 @@ test("ChatGPT file downloader pauses all workers during shared 429 backoff", asy
   }
 
   const out = await downloadPromise;
-  assert.equal(out.counts.files, 7);
-  assert.equal(out.counts.downloaded, 7);
+  assert.equal(out.counts.files, 12);
+  assert.equal(out.counts.downloaded, 12);
 });
 
 test("Claude downloadable file collector handles current file shapes", () => {
@@ -898,7 +898,7 @@ test("Claude file download does not byte-dedupe distinct metadata records", asyn
   assert.equal(requested.filter((url) => String(url).includes("/download/")).length, 2);
 });
 
-test("Claude file downloader limits concurrent downloads to five", async () => {
+test("Claude file downloader limits concurrent downloads to ten", async () => {
   const claude = loadClaudeExporter();
   const pending = [];
   let active = 0;
@@ -942,7 +942,7 @@ test("Claude file downloader limits concurrent downloads to five", async () => {
     name: "Parallel",
     chat_messages: [
       claudeMessage("a1", "assistant", {
-        generated_files: Array.from({ length: 8 }, (_, index) => ({
+          generated_files: Array.from({ length: 12 }, (_, index) => ({
           id: `file-${index}`,
           filename: `file-${index}.txt`,
           download_url: `/download/file-${index}.txt`
@@ -951,10 +951,10 @@ test("Claude file downloader limits concurrent downloads to five", async () => {
     ]
   }, "conv", "org");
 
-  while (pending.length < 5) await Promise.resolve();
-  assert.equal(maxActive, 5);
+  while (pending.length < 10) await Promise.resolve();
+  assert.equal(maxActive, 10);
 
-  while (completed < 8) {
+  while (completed < 12) {
     while (!pending.length) await Promise.resolve();
     const next = pending.shift();
     next();
@@ -962,9 +962,9 @@ test("Claude file downloader limits concurrent downloads to five", async () => {
   }
 
   const out = await downloadPromise;
-  assert.equal(out.counts.files, 8);
-  assert.equal(out.counts.downloaded, 8);
-  assert.equal(maxActive, 5);
+  assert.equal(out.counts.files, 12);
+  assert.equal(out.counts.downloaded, 12);
+  assert.equal(maxActive, 10);
 });
 
 test("Claude file downloader pauses all workers during shared 429 backoff", async () => {
@@ -1004,7 +1004,7 @@ test("Claude file downloader pauses all workers during shared 429 backoff", asyn
     name: "Backoff",
     chat_messages: [
       claudeMessage("a1", "assistant", {
-        generated_files: Array.from({ length: 7 }, (_, index) => ({
+        generated_files: Array.from({ length: 12 }, (_, index) => ({
           id: `file-${index}`,
           filename: `file-${index}.txt`,
           download_url: `/download/file-${index}.txt`
@@ -1013,8 +1013,8 @@ test("Claude file downloader pauses all workers during shared 429 backoff", asyn
     ]
   }, "conv", "org");
 
-  while (pending.length < 5) await Promise.resolve();
-  assert.equal(requested.filter((url) => url.includes("/download/")).length, 5);
+  while (pending.length < 10) await Promise.resolve();
+  assert.equal(requested.filter((url) => url.includes("/download/")).length, 10);
 
   pending.shift().resolve({
     ok: false,
@@ -1037,11 +1037,11 @@ test("Claude file downloader pauses all workers during shared 429 backoff", asyn
     await Promise.resolve();
   }
 
-  assert.equal(requested.filter((url) => url.includes("/download/")).length, 5);
+  assert.equal(requested.filter((url) => url.includes("/download/")).length, 10);
 
   timers.shift().callback();
   while (pending.length < 3) await Promise.resolve();
-  assert.equal(requested.filter((url) => url.includes("/download/")).length, 8);
+  assert.equal(requested.filter((url) => url.includes("/download/")).length, 13);
 
   while (pending.length) {
     pending.shift().resolve({
@@ -1054,8 +1054,8 @@ test("Claude file downloader pauses all workers during shared 429 backoff", asyn
   }
 
   const out = await downloadPromise;
-  assert.equal(out.counts.files, 7);
-  assert.equal(out.counts.downloaded, 7);
+  assert.equal(out.counts.files, 12);
+  assert.equal(out.counts.downloaded, 12);
 });
 
 test("Claude ZIP writer stores byte-part entries in one archive", async () => {

@@ -3,7 +3,7 @@ var CLAUDE_EXPORT_MODE_ALL = "all-branches";
 var CLAUDE_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
 var CLAUDE_BRANCH_STRUCTURE = "segment-tree";
 var CLAUDE_ROOT_PARENT_UUID = "00000000-0000-4000-8000-000000000000";
-var CLAUDE_FILE_DOWNLOAD_CONCURRENCY = 5;
+var CLAUDE_FILE_DOWNLOAD_CONCURRENCY = 10;
 
 (async () => {
   if (window.__claudeConversationExportInProgress) {
