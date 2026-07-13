@@ -167,17 +167,6 @@ function exportTree(mapping) {
   }, "conv");
 }
 
-function currentBranchExport(mapping, currentNode, mode) {
-  const sandbox = loadChatGptExporter();
-  sandbox.window.__chatGptExportMode = mode;
-  return sandbox.buildChatGptCurrentBranchExport({
-    conversation_id: "conv",
-    title: "Harness",
-    current_node: currentNode,
-    mapping
-  }, "conv");
-}
-
 function flattenMessages(branchNode) {
   return branchNode.messages.concat(...branchNode.branches.flatMap(flattenMessages));
 }
@@ -207,30 +196,13 @@ test("ChatGPT all-branches export keeps common messages above fork branches", ()
   });
 });
 
-test("ChatGPT backend-current mode skips rendered DOM branch collection", async () => {
-  const out = await currentBranchExport({
-    root: { id: "root", parent: null, children: ["u1"], message: null },
-    u1: node("u1", "root", ["a1"], message("u1", "user")),
-    a1: node("a1", "u1", [], message("a1", "assistant"))
-  }, "a1", "backend-current");
-
-  assert.equal(out.exportMode, "current-branch");
-  assert.equal(out.branchSource, "backend-current-node");
-  assert.deepEqual(plain(out.messages.map((item) => item.id)), ["u1", "a1"]);
-  assert.deepEqual(plain(out.counts), {
-    messages: 2,
-    user: 1,
-    assistant: 1,
-    files: 0
-  });
-});
-
-test("ChatGPT current-branch mode still uses rendered branch when available", async () => {
+test("ChatGPT current-branch export uses the backend current node without inspecting the DOM", async () => {
   const sandbox = loadChatGptExporter();
-  sandbox.collectRenderedChatGptMessageIds = async () => ({
-    reachedBottom: true,
-    messageIds: ["u2", "a2"]
-  });
+  let inspectedRenderedDom = false;
+  sandbox.collectRenderedChatGptMessageIds = async () => {
+    inspectedRenderedDom = true;
+    return { reachedBottom: true, messageIds: ["u2", "a2"] };
+  };
 
   const out = await sandbox.buildChatGptCurrentBranchExport({
     conversation_id: "conv",
@@ -245,8 +217,16 @@ test("ChatGPT current-branch mode still uses rendered branch when available", as
     }
   }, "conv");
 
-  assert.equal(out.branchSource, "visible-dom-leaf");
-  assert.deepEqual(plain(out.messages.map((item) => item.id)), ["u1", "u2", "a2"]);
+  assert.equal(out.exportMode, "current-branch");
+  assert.equal(out.branchSource, "backend-current-node");
+  assert.equal(inspectedRenderedDom, false);
+  assert.deepEqual(plain(out.messages.map((item) => item.id)), ["u1", "a1"]);
+  assert.deepEqual(plain(out.counts), {
+    messages: 2,
+    user: 1,
+    assistant: 1,
+    files: 0
+  });
 });
 
 test("ChatGPT all-branches export handles nested forks", () => {

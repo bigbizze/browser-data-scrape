@@ -2,7 +2,6 @@ const CHATGPT_CONVERSATION_PATH_RE = /(?:^|\/)c\/[0-9a-f-]{36}(?:\/|$)/i;
 const CLAUDE_ID_RE = /^[0-9a-f-]{16,}$/i;
 const CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
 const CHATGPT_EXPORT_MODE_ALL = "all-branches";
-const CHATGPT_EXPORT_MODE_BACKEND_CURRENT = "backend-current";
 const CHATGPT_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
 const CLAUDE_EXPORT_MODE_CURRENT = "current-branch";
 const CLAUDE_EXPORT_MODE_ALL = "all-branches";
@@ -178,7 +177,7 @@ async function initializeChatGptButtons(tab, target) {
     renderButtons([
       {
         label: "Export conversation",
-        onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_BACKEND_CURRENT)
+        onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_CURRENT)
       },
       {
         label: fileCount ? `Download all files (${fileCount})` : "Download all files",

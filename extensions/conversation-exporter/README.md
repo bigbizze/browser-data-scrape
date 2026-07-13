@@ -19,6 +19,7 @@ The exported file is downloaded as JSON.
 ## Notes
 
 - ChatGPT exports use the private `/api/auth/session` and `/backend-api/conversation/<id>` endpoints through your existing logged-in browser session.
+- ChatGPT current-branch exports follow the backend response's `current_node`; they do not scroll or crawl the rendered conversation.
 - Claude exports use the private `/api/organizations/<org>/chat_conversations/<id>` endpoint through your existing logged-in browser session. If the Claude API export fails, the extension tries a best-effort visible DOM fallback.
 - The JSON includes attachment and image references in the file manifest. It does not download attached file binaries.
 - If the extension icon stays disabled right after loading the extension, reload the ChatGPT or Claude tab.

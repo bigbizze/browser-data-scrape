@@ -1,6 +1,5 @@
 var CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
 var CHATGPT_EXPORT_MODE_ALL = "all-branches";
-var CHATGPT_EXPORT_MODE_BACKEND_CURRENT = "backend-current";
 var CHATGPT_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
 var CHATGPT_BRANCH_STRUCTURE = "segment-tree";
 var CHATGPT_FILE_DOWNLOAD_CONCURRENCY = 10;
@@ -40,7 +39,6 @@ var CHATGPT_FILE_DOWNLOAD_CONCURRENCY = 10;
 })();
 
 function normalizeChatGptExportMode(mode) {
-  if (mode === CHATGPT_EXPORT_MODE_BACKEND_CURRENT) return CHATGPT_EXPORT_MODE_BACKEND_CURRENT;
   if (mode === CHATGPT_EXPORT_MODE_DOWNLOAD_FILES) return CHATGPT_EXPORT_MODE_DOWNLOAD_FILES;
   return mode === CHATGPT_EXPORT_MODE_ALL ? CHATGPT_EXPORT_MODE_ALL : CHATGPT_EXPORT_MODE_CURRENT;
 }
@@ -641,12 +639,10 @@ function getCrc32Table() {
 }
 
 async function buildChatGptCurrentBranchExport(conv, convId) {
-  const branch = window.__chatGptExportMode === CHATGPT_EXPORT_MODE_BACKEND_CURRENT
-    ? {
-        order: getActiveBranchOrder(conv.mapping, conv.current_node),
-        source: "backend-current-node"
-      }
-    : await getRenderedBranchOrder(conv.mapping, conv.current_node);
+  const branch = {
+    order: getActiveBranchOrder(conv.mapping, conv.current_node),
+    source: "backend-current-node"
+  };
   const segment = buildMessages(branch.order, conv.mapping, null);
 
   return {
@@ -1046,192 +1042,6 @@ function getActiveBranchOrder(mapping, currentNode) {
   }
 
   return order.reverse();
-}
-
-async function getRenderedBranchOrder(mapping, currentNode) {
-  const fallback = () => ({
-    order: getActiveBranchOrder(mapping, currentNode),
-    source: "backend-current-node"
-  });
-
-  let rendered;
-  try {
-    rendered = await collectRenderedChatGptMessageIds();
-  } catch (error) {
-    console.warn("[backend-export] Could not read rendered ChatGPT branch; using backend current_node.", error);
-    return fallback();
-  }
-
-  const messageIds = rendered.messageIds || [];
-  if (!messageIds.length) {
-    return fallback();
-  }
-
-  const nodeIdByMessageId = indexNodeIdsByMessageId(mapping);
-  const visibleNodeIds = unique(messageIds
-    .map((messageId) => nodeIdByMessageId.get(messageId))
-    .filter(Boolean));
-
-  if (!visibleNodeIds.length) {
-    return fallback();
-  }
-
-  const selectedLeaf = visibleNodeIds[visibleNodeIds.length - 1];
-  const leafOrder = getActiveBranchOrder(mapping, selectedLeaf);
-  const leafOrderSet = new Set(leafOrder);
-
-  if (leafOrder.length && visibleNodeIds.every((nodeId) => leafOrderSet.has(nodeId))) {
-    return {
-      order: leafOrder,
-      source: rendered.reachedBottom ? "visible-dom-leaf" : "visible-dom-leaf-partial-scroll"
-    };
-  }
-
-  return {
-    order: visibleNodeIds,
-    source: rendered.reachedBottom ? "visible-dom-order" : "visible-dom-order-partial-scroll"
-  };
-}
-
-function indexNodeIdsByMessageId(mapping) {
-  const out = new Map();
-
-  for (const [nodeId, node] of Object.entries(mapping)) {
-    const messageId = node && node.message && node.message.id;
-    if (messageId && !out.has(messageId)) {
-      out.set(messageId, nodeId);
-    }
-
-    if (nodeId && !out.has(nodeId)) {
-      out.set(nodeId, nodeId);
-    }
-  }
-
-  return out;
-}
-
-function unique(values) {
-  const seen = new Set();
-  const out = [];
-
-  for (const value of values) {
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
-  }
-
-  return out;
-}
-
-async function collectRenderedChatGptMessageIds() {
-  const scroller = findChatGptScroller();
-  const originalTop = scroller.scrollTop;
-  const originalBehavior = scroller.style.scrollBehavior;
-  const records = new Map();
-  let sequence = 0;
-  let reachedBottom = false;
-
-  scroller.style.scrollBehavior = "auto";
-
-  try {
-    scroller.scrollTop = 0;
-    await sleep(350);
-    captureRenderedMessages(scroller, records, () => sequence++);
-
-    let idle = 0;
-    let steps = 0;
-    const maxSteps = 5000;
-
-    while (steps++ < maxSteps) {
-      const previousTop = scroller.scrollTop;
-      scroller.scrollTop = Math.min(
-        scroller.scrollTop + scroller.clientHeight * 0.85,
-        scroller.scrollHeight
-      );
-
-      await sleep(350);
-      const added = captureRenderedMessages(scroller, records, () => sequence++);
-      const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
-      const stuck = scroller.scrollTop <= previousTop + 1;
-
-      if (atBottom) reachedBottom = true;
-
-      if (added > 0) {
-        idle = 0;
-      } else if (atBottom || stuck) {
-        idle++;
-        if (idle >= 3) break;
-        await sleep(350);
-      } else {
-        idle = 0;
-      }
-    }
-  } finally {
-    scroller.scrollTop = originalTop;
-    scroller.style.scrollBehavior = originalBehavior;
-  }
-
-  const messageIds = [...records.values()]
-    .sort((a, b) => (a.y - b.y) || (a.sequence - b.sequence))
-    .map((record) => record.id);
-
-  return { messageIds, reachedBottom };
-}
-
-function findChatGptScroller() {
-  const thread = document.getElementById("thread");
-  let element = document.querySelector(".group\\/scroll-root")
-    || (thread && thread.closest('[class*="overflow-y-auto"]'));
-
-  if (!element && thread) {
-    for (let node = thread.parentElement; node; node = node.parentElement) {
-      const overflowY = getComputedStyle(node).overflowY;
-      if ((overflowY === "auto" || overflowY === "scroll") && node.scrollHeight > node.clientHeight) {
-        element = node;
-        break;
-      }
-    }
-  }
-
-  return element || document.scrollingElement || document.documentElement;
-}
-
-function captureRenderedMessages(scroller, records, nextSequence) {
-  let added = 0;
-
-  document.querySelectorAll("[data-message-author-role][data-message-id]").forEach((element) => {
-    const id = element.getAttribute("data-message-id");
-    const role = element.getAttribute("data-message-role")
-      || element.getAttribute("data-message-author-role");
-
-    if (!id || (role !== "user" && role !== "assistant")) return;
-    if (!isVisibleElement(element)) return;
-
-    const y = getAbsoluteY(element, scroller);
-    const record = records.get(id);
-
-    if (!record) {
-      records.set(id, { id, y, sequence: nextSequence() });
-      added++;
-    } else {
-      record.y = y;
-    }
-  });
-
-  return added;
-}
-
-function isVisibleElement(element) {
-  const rect = element.getBoundingClientRect();
-  if (!rect.width && !rect.height) return false;
-
-  const style = getComputedStyle(element);
-  return style.display !== "none" && style.visibility !== "hidden";
-}
-
-function getAbsoluteY(element, scroller) {
-  const scrollerTop = scroller.getBoundingClientRect().top;
-  return element.getBoundingClientRect().top - scrollerTop + scroller.scrollTop;
 }
 
 function sleep(ms) {
