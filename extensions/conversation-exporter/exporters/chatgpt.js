@@ -254,25 +254,122 @@ async function downloadChatGptFilesToZip(files, archiveName, token) {
 }
 
 async function fetchChatGptDownloadEntry(file, token, rateLimitGate) {
+  const resolved = await fetchChatGptDownloadResponse(file, token, rateLimitGate);
+  const response = resolved.response;
+  const headerName = getFilenameFromContentDisposition(
+    response.headers && response.headers.get("content-disposition")
+  );
+  const descriptorName = resolved.descriptor && resolved.descriptor.file_name;
+  const name = sanitizeDownloadName(
+    file.downloadName || headerName || descriptorName || file.name || `${file.id || "file"}.bin`
+  );
+  const entryParts = await readResponseZipEntryParts(response);
+  const descriptorSize = resolved.descriptor && resolved.descriptor.file_size_bytes;
+  const expectedSize = Number.isFinite(descriptorSize) ? descriptorSize : file.size;
+
+  if (Number.isFinite(expectedSize) && entryParts.size !== expectedSize) {
+    throw new Error(
+      `File ${name} expected ${expectedSize} bytes but received ${entryParts.size} bytes.`
+    );
+  }
+
+  return {
+    name,
+    ...entryParts
+  };
+}
+
+async function fetchChatGptDownloadResponse(file, token, rateLimitGate) {
+  const label = `File ${file.downloadName || file.name || file.id}`;
   const response = await fetchChatGptWithRetry(file.url, {
     credentials: "include",
     headers: {
       Authorization: `Bearer ${token}`
     }
   }, {
-    label: `File ${file.downloadName || file.name || file.id}`,
+    label,
     rateLimitGate
   });
+  const descriptor = await readChatGptDownloadDescriptor(response);
 
-  const headerName = getFilenameFromContentDisposition(
-    response.headers && response.headers.get("content-disposition")
+  if (!descriptor) {
+    return { response, descriptor: null };
+  }
+
+  const downloadUrl = normalizeChatGptDownloadUrl(descriptor.download_url);
+  const contentResponse = await fetchChatGptWithRetry(
+    downloadUrl,
+    getChatGptContentRequestInit(downloadUrl, token),
+    {
+      label: `${label} content`,
+      rateLimitGate
+    }
   );
-  const name = sanitizeDownloadName(headerName || file.downloadName || file.name || `${file.id || "file"}.bin`);
-  const entryParts = await readResponseZipEntryParts(response);
 
   return {
-    name,
-    ...entryParts
+    response: contentResponse,
+    descriptor
+  };
+}
+
+async function readChatGptDownloadDescriptor(response) {
+  const contentType = String(
+    response && response.headers && response.headers.get("content-type") || ""
+  ).toLowerCase();
+
+  if (!contentType.includes("json")) return null;
+
+  const readable = response && typeof response.clone === "function" ? response.clone() : response;
+  let data;
+
+  try {
+    data = await readable.json();
+  } catch (error) {
+    return null;
+  }
+
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  if (!Object.prototype.hasOwnProperty.call(data, "download_url")) return null;
+
+  const status = String(data.status || "success").toLowerCase();
+  if (status !== "success") {
+    throw new Error(`ChatGPT returned file download status ${data.status || "unknown"}.`);
+  }
+
+  if (typeof data.download_url !== "string" || !data.download_url.trim()) {
+    throw new Error("ChatGPT returned a file download descriptor with no download URL.");
+  }
+
+  return data;
+}
+
+function normalizeChatGptDownloadUrl(value) {
+  let parsed;
+
+  try {
+    parsed = new URL(value, location.origin);
+  } catch (error) {
+    throw new Error("ChatGPT returned an invalid file download URL.");
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new Error(`ChatGPT returned an unsupported file download protocol: ${parsed.protocol}`);
+  }
+
+  return parsed.href;
+}
+
+function getChatGptContentRequestInit(downloadUrl, token) {
+  const sameOrigin = new URL(downloadUrl).origin === location.origin;
+  const headers = {};
+
+  if (sameOrigin) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  return {
+    credentials: sameOrigin ? "include" : "omit",
+    headers
   };
 }
 

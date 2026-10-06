@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Conversation Exporter",
-  "version": "0.2.1",
-  "description": "Exports the active ChatGPT or Claude conversation to JSON.",
+  "version": "0.2.3",
+  "description": "Exports ChatGPT or Claude conversations and downloads their files.",
   "permissions": [
     "activeTab",
     "scripting",

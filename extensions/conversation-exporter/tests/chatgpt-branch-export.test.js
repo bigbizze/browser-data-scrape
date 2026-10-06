@@ -492,6 +492,127 @@ test("ChatGPT file download uses files endpoint and zips returned bodies", async
   );
 });
 
+test("ChatGPT file download follows JSON descriptors and stores attachment bytes", async () => {
+  const chatgpt = loadChatGptExporter();
+  const calls = [];
+  const zipBytes = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]);
+  const pastedText = "Phases 0-2 are complete. Phase 3 has not started.";
+  const cases = [
+    {
+      file: {
+        id: "file_zip",
+        name: "query-spec.zip",
+        downloadName: "query-spec.zip",
+        url: "https://chatgpt.com/backend-api/files/download/file_zip"
+      },
+      contentUrl: "https://chatgpt.com/backend-api/estuary/content?id=file_zip&sig=signed",
+      bytes: zipBytes
+    },
+    {
+      file: {
+        id: "file_text",
+        name: "Pasted text (3)(20260814-170409).txt",
+        downloadName: "Pasted text (3)(20260814-170409).txt",
+        url: "https://chatgpt.com/backend-api/files/download/file_text"
+      },
+      contentUrl: "https://files.openaiusercontent.com/file_text?sig=signed",
+      bytes: pastedText
+    }
+  ];
+
+  chatgpt.fetch = async (url, init = {}) => {
+    const requestUrl = String(url);
+    calls.push({ url: requestUrl, init });
+
+    const descriptorCase = cases.find((item) => item.file.url === requestUrl);
+    if (descriptorCase) {
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name) => name.toLowerCase() === "content-type" ? "application/json" : ""
+        },
+        json: async () => ({
+          status: "success",
+          download_url: descriptorCase.contentUrl,
+          file_name: descriptorCase.file.name,
+          file_size_bytes: typeof descriptorCase.bytes === "string"
+            ? Buffer.byteLength(descriptorCase.bytes)
+            : descriptorCase.bytes.length
+        })
+      };
+    }
+
+    const contentCase = cases.find((item) => item.contentUrl === requestUrl);
+    if (contentCase) {
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name) => name.toLowerCase() === "content-disposition"
+            ? 'attachment; filename="server-name.bin"'
+            : ""
+        },
+        blob: async () => new Blob([contentCase.bytes])
+      };
+    }
+
+    throw new Error(`Unexpected fetch URL: ${url}`);
+  };
+
+  const entries = [];
+  for (const item of cases) {
+    entries.push(await chatgpt.fetchChatGptDownloadEntry(
+      item.file,
+      "token",
+      chatgpt.createChatGptRateLimitGate()
+    ));
+  }
+
+  assert.deepEqual(entries.map((entry) => entry.name), cases.map((item) => item.file.downloadName));
+  assert.deepEqual(
+    Buffer.concat(entries[0].parts.map((part) => Buffer.from(part))),
+    Buffer.from(zipBytes)
+  );
+  assert.equal(
+    Buffer.concat(entries[1].parts.map((part) => Buffer.from(part))).toString("utf8"),
+    pastedText
+  );
+
+  const descriptorCalls = calls.filter((call) => call.url.includes("/backend-api/files/download/"));
+  assert.equal(descriptorCalls.length, 2);
+  assert.equal(descriptorCalls.every((call) => call.init.headers.Authorization === "Bearer token"), true);
+
+  const sameOriginContentCall = calls.find((call) => call.url === cases[0].contentUrl);
+  assert.equal(sameOriginContentCall.init.credentials, "include");
+  assert.equal(sameOriginContentCall.init.headers.Authorization, "Bearer token");
+
+  const crossOriginContentCall = calls.find((call) => call.url === cases[1].contentUrl);
+  assert.equal(crossOriginContentCall.init.credentials, "omit");
+  assert.equal(crossOriginContentCall.init.headers.Authorization, undefined);
+});
+
+test("ChatGPT file download rejects byte-count mismatches", async () => {
+  const chatgpt = loadChatGptExporter();
+  chatgpt.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => "" },
+    blob: async () => new Blob(["bad"])
+  });
+
+  await assert.rejects(
+    chatgpt.fetchChatGptDownloadEntry({
+      id: "file_bad",
+      name: "bad.zip",
+      downloadName: "bad.zip",
+      size: 4,
+      url: "https://chatgpt.com/backend-api/files/download/file_bad"
+    }, "token", chatgpt.createChatGptRateLimitGate()),
+    /expected 4 bytes but received 3 bytes/
+  );
+});
+
 test("ChatGPT file downloader limits concurrent downloads to ten", async () => {
   const chatgpt = loadChatGptExporter();
   const pending = [];
@@ -1067,4 +1188,94 @@ test("Claude ZIP writer stores byte-part entries in one archive", async () => {
   assert.match(text, /outputs\/report\/second\.json/);
   assert.match(text, /alpha/);
   assert.match(text, /\{"ok":true\}/);
+});
+
+test("Claude recorded artifact source follows ancestry and applies literal edits", () => {
+  const claude = loadClaudeExporter();
+  const tool = (name, input, id = name) => ({ type: "tool_use", name, input, id });
+  const root = claudeMessage("root", "assistant", { content: [
+    tool("Write", { file_path: "/tmp/demo.html", content: "<p>old</p>" })
+  ] });
+  const branch = claudeMessage("branch", "assistant", { parent_message_uuid: "root", content: [
+    tool("Edit", { file_path: "/tmp/demo.html", old_string: "old", new_string: "$& new" }),
+    tool("Artifact", { file_path: "/tmp/demo.html" })
+  ] });
+  const sibling = claudeMessage("sibling", "assistant", { parent_message_uuid: "root", content: [
+    tool("Artifact", { file_path: "/tmp/demo.html" })
+  ] });
+  const files = claude.collectClaudeDownloadableFiles({ chat_messages: [branch, sibling, root] }, "conv", "org");
+  assert.deepEqual(plain(files.map(file => file.content)), ["<p>$& new</p>", "<p>old</p>"]);
+  assert.deepEqual(plain(files.map(file => file.zipPath)), ["recorded-source/demo.html", "recorded-source/demo (2).html"]);
+});
+
+test("Claude recorded source excludes failed writes and ambiguous edits", () => {
+  const claude = loadClaudeExporter();
+  const files = claude.getClaudeWrittenArtifactFiles([claudeMessage("m", "assistant", { content: [
+    { type: "tool_use", id: "w", name: "Write", input: { file_path: "/a", content: "wrong" } },
+    { type: "tool_result", tool_use_id: "w", is_error: true },
+    { type: "tool_use", name: "Artifact", input: { file_path: "/a" } },
+    { type: "tool_use", name: "Write", input: { file_path: "/b", content: "xx" } },
+    { type: "tool_use", name: "Edit", input: { file_path: "/b", old_string: "x", new_string: "y" } },
+    { type: "tool_use", name: "Artifact", input: { file_path: "/b" } }
+  ] })]);
+  assert.equal(files.length, 0);
+});
+
+test("Claude published artifact export fetches source bytes and preserves supporting files", async () => {
+  const claude = loadClaudeExporter();
+  const uuid = "11111111-1111-1111-1111-111111111111";
+  claude.DOMParser = class {
+    parseFromString() { return { documentElement: { dataset: { frameUuid: uuid, frameUchost: `${uuid}.frame.claudeusercontent.com` } } }; }
+  };
+  const calls = [];
+  claude.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    if (String(url).includes("/artifact/demo")) return new Response("shell");
+    if (String(url).includes("/api/frame/")) {
+      assert.equal(init.headers["x-frame-cp"], "go");
+      return Response.json({ ver: "v1", assetToken: "signed-test", files: [
+        { path: "index.html", contentType: "text/html" }, { path: "styles/main.css", contentType: "text/css" }
+      ] });
+    }
+    assert.equal(init.credentials, "omit");
+    assert.match(String(url), /\/_src\//);
+    return new Response(String(url).includes("main.css") ? "p { color:red }" : "<!doctype html><p>Actual source</p>");
+  };
+  const files = [];
+  await claude.addClaudePublishedArtifactFiles(files, { chat_messages: [{ content: [
+    { type: "tool_result", content: [{ text: "Published at https://claude.ai/artifact/demo (Version 1)" }] },
+    { text: "https://claude.ai/artifact/demo" }
+  ] }] }, "org");
+  assert.equal(files.length, 2);
+  assert.equal(files[1].zipPath, "artifacts/demo/styles/main.css");
+  const entry = await claude.fetchClaudeDownloadEntry(files[0]);
+  assert.equal(Buffer.concat(entry.parts.map(Buffer.from)).toString(), "<!doctype html><p>Actual source</p>");
+  assert.equal(calls.filter(call => call.url.includes("/artifact/demo")).length, 1);
+});
+
+test("Claude ZIP preserves unique names despite identical response filenames and records missing artifacts", async () => {
+  const claude = loadClaudeExporter();
+  claude.setTimeout = callback => { callback(); return 0; };
+  let downloaded;
+  claude.downloadBlob = blob => { downloaded = blob; };
+  claude.fetch = async () => new Response("real content", { headers: { "content-disposition": 'attachment; filename="same.html"' } });
+  const files = [
+    { name: "same.html", url: "/one" }, { name: "same.html", url: "/two" },
+    { name: "same (2).html", url: "/three" },
+    { name: "missing", error: "Artifact unavailable" }
+  ];
+  claude.applyUniqueDownloadNames(files);
+  const out = await claude.downloadClaudeFilesToZip(files, "test.zip");
+  assert.equal(out.results.filter(result => result.ok).length, 3);
+  const bytes = Buffer.from(await downloaded.arrayBuffer());
+  const names = [];
+  for (let offset = 0; bytes.readUInt32LE(offset) === 0x04034b50;) {
+    const length = bytes.readUInt16LE(offset + 26);
+    const extra = bytes.readUInt16LE(offset + 28);
+    const size = bytes.readUInt32LE(offset + 18);
+    names.push(bytes.subarray(offset + 30, offset + 30 + length).toString());
+    offset += 30 + length + extra + size;
+  }
+  assert.deepEqual(names, ["same.html", "same (2).html", "same (2) (2).html", "export-failures.json"]);
+  assert.match(bytes.toString(), /Artifact unavailable/);
 });

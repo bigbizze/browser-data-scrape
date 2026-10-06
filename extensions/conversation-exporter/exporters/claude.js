@@ -227,6 +227,7 @@ async function fetchClaudeWiggleFiles(conversationId, orgId) {
 async function downloadClaudeConversationFiles(data, conversationId, orgId) {
   const files = collectClaudeDownloadableFiles(data, conversationId, orgId);
   let workspaceListError = null;
+  await addClaudePublishedArtifactFiles(files, data, orgId);
 
   try {
     addClaudeWiggleFiles(files, await fetchClaudeWiggleFiles(conversationId, orgId), conversationId, orgId);
@@ -288,7 +289,7 @@ async function downloadClaudeFilesToZip(files, archiveName) {
       try {
         const entry = await fetchClaudeDownloadEntry(file, rateLimitGate);
         await zip.addEntry({
-          name: file.zipPath || entry.name,
+          name: file.zipPath || file.downloadName || entry.name,
           parts: entry.parts,
           size: entry.size,
           crc: entry.crc,
@@ -312,6 +313,18 @@ async function downloadClaudeFilesToZip(files, archiveName) {
   await Promise.all(workers);
 
   if (zip.count > 0) {
+    const failures = results.filter((result) => !result.ok);
+    if (failures.length) {
+      const used = new Set(files.map((file) => (file.zipPath || file.downloadName).toLowerCase()));
+      let name = "export-failures.json";
+      for (let suffix = 2; used.has(name.toLowerCase()); suffix++) {
+        name = `export-failures (${suffix}).json`;
+      }
+      const bytes = new TextEncoder().encode(JSON.stringify(failures.map(({ file, error }) => ({
+        name: file.downloadName, messageId: file.messageId, source: file.source, error
+      })), null, 2));
+      await zip.addEntry({ name, parts: [bytes], size: bytes.length, crc: crc32(bytes), lastModified: new Date() });
+    }
     downloadBlob(zip.toBlob(), archiveName);
   }
 
@@ -360,6 +373,7 @@ function collectClaudeDownloadableFiles(data, conversationId, orgId) {
     }
   });
 
+  files.push(...getClaudeWrittenArtifactFiles(messages));
   applyUniqueDownloadNames(files);
   return files;
 }
@@ -484,6 +498,124 @@ function getClaudeArtifactDownloadFiles(message, messageIndex, owner) {
   return out;
 }
 
+// Save recorded source separately from the live published artifact. It may predate
+// changes made through shell commands or external tools.
+function getClaudeWrittenArtifactFiles(messages) {
+  const byId = new Map(messages.filter(Boolean).map((message) => [message.uuid, message]));
+  const statesById = new Map();
+  const visiting = new Set();
+  const failed = new Set(messages.flatMap((message) => Array.isArray(message && message.content) ? message.content : [])
+    .filter((block) => block && block.type === "tool_result" && block.is_error)
+    .map((block) => block.tool_use_id));
+  const out = [];
+  function visit(message, messageIndex) {
+    if (!message || statesById.has(message.uuid)) return statesById.get(message && message.uuid) || new Map();
+    if (visiting.has(message.uuid)) return new Map();
+    visiting.add(message.uuid);
+    const parent = byId.get(message.parent_message_uuid);
+    const states = new Map(parent ? visit(parent, messages.indexOf(parent)) : []);
+    const blocks = Array.isArray(message.content) ? message.content : [];
+    for (const block of blocks) {
+      if (!block || block.type !== "tool_use" || failed.has(block.id)) continue;
+      const input = block.input;
+      if (!input || typeof input !== "object") continue;
+      const path = input.file_path;
+      if (block.name === "Write" && typeof path === "string" && typeof input.content === "string") {
+        states.set(path, input.content);
+      } else if (block.name === "Edit" && typeof path === "string") {
+        const previous = states.get(path);
+        const old = input.old_string;
+        if (typeof previous !== "string" || typeof old !== "string" || !old
+            || typeof input.new_string !== "string" || !previous.includes(old)
+            || (!input.replace_all && previous.indexOf(old) !== previous.lastIndexOf(old))) {
+          states.delete(path);
+          continue;
+        }
+        states.set(path, input.replace_all
+          ? previous.split(old).join(input.new_string)
+          : previous.replace(old, () => input.new_string));
+      } else if (block.name === "Artifact" || block.name === "SendUserFile") {
+        const paths = block.name === "Artifact" ? [path] : input.files;
+        for (const path of Array.isArray(paths) ? paths : []) {
+          if (typeof path !== "string" || !states.has(path)) continue;
+          const name = sanitizeDownloadName(path);
+          out.push({
+            messageIndex, messageId: message.uuid || null,
+            owner: normalizeClaudeRole(message.sender) || "unknown",
+            id: block.id || path, name, downloadName: name, downloadNameBase: name,
+            zipPath: `recorded-source/${name}`,
+            mime: "text/plain;charset=utf-8", kind: "document",
+            source: "artifact-recorded-source", url: "", content: states.get(path)
+          });
+        }
+      }
+    }
+    visiting.delete(message.uuid);
+    statesById.set(message.uuid, states);
+    return states;
+  }
+  messages.forEach(visit);
+  return out;
+}
+
+function collectClaudePublishedArtifactUrls(data) {
+  // Only known Claude artifact links are fetched, never arbitrary conversation URLs.
+  const urls = new Set();
+  function visit(value) {
+    if (typeof value === "string") {
+      for (const match of value.matchAll(/https:\/\/claude\.ai\/artifact\/([A-Za-z0-9_-]+)/g)) {
+        urls.add(`https://claude.ai/artifact/${match[1]}`);
+      }
+    } else if (Array.isArray(value)) value.forEach(visit);
+    else if (value && typeof value === "object") Object.values(value).forEach(visit);
+  }
+  visit(data.chat_messages || []);
+  return [...urls];
+}
+
+async function addClaudePublishedArtifactFiles(files, data, orgId) {
+  for (const artifactUrl of collectClaudePublishedArtifactUrls(data)) {
+    const slug = artifactUrl.split("/").pop();
+    try {
+      const shell = await fetchClaudeWithRetry(artifactUrl, { credentials: "include" }, { label: "Artifact" });
+      const doc = new DOMParser().parseFromString(await shell.text(), "text/html");
+      const uuid = doc.documentElement.dataset.frameUuid;
+      const host = doc.documentElement.dataset.frameUchost;
+      if (!uuid || !/^[0-9a-f-]{36}$/i.test(uuid) || host !== `${uuid}.frame.claudeusercontent.com`) {
+        throw new Error("Artifact page did not provide a valid source host.");
+      }
+      // The frame service requires its routing header. Without it, valid artifacts return 404.
+      const response = await fetchClaudeWithRetry(
+        `${location.origin}/api/frame/${uuid}?org=${encodeURIComponent(orgId)}`,
+        { credentials: "include", headers: { "x-frame-cp": "go" } }, { label: "Artifact metadata" }
+      );
+      const metadata = await response.json();
+      if (!metadata.ver || !metadata.assetToken || !Array.isArray(metadata.files) || !metadata.files.length) {
+        throw new Error("Artifact metadata did not include source files.");
+      }
+      const entries = metadata.files.map((item) => {
+        const path = item.path;
+        if (typeof path !== "string" || !path || path.split("/").some((part) => !part || part === "." || part === "..")
+            || path.includes("\\")) throw new Error("Artifact returned an invalid file path.");
+        const url = new URL(`https://${host}/_f/${encodeURIComponent(metadata.ver)}/_src/${path.split("/").map(encodeURIComponent).join("/")}`);
+        url.searchParams.set("__frame_t", metadata.assetToken);
+        const name = sanitizeDownloadName(path);
+        return {
+          id: `${slug}/${metadata.ver}/${path}`, name, downloadName: name, downloadNameBase: name,
+          zipPath: `artifacts/${slug}/${path}`, mime: item.contentType || "", kind: inferFileKind(name, item.contentType),
+          source: "artifact-published-source", artifactUrl, url: url.href, credentials: "omit"
+        };
+      });
+      files.push(...entries);
+    } catch (error) {
+      files.push({ id: slug, name: slug, downloadName: slug, downloadNameBase: slug,
+        source: "artifact-published-source", artifactUrl, url: "",
+        error: `Could not export ${artifactUrl}: ${error.message || error}` });
+    }
+  }
+  applyUniqueDownloadNames(files);
+}
+
 function getClaudeFileId(file) {
   return String(
     file.file_uuid
@@ -558,14 +690,20 @@ function getClaudeDownloadFileKey(file) {
 }
 
 function applyUniqueDownloadNames(files) {
-  const used = new Map();
-
+  const used = new Set();
   for (const file of files) {
-    const name = sanitizeDownloadName(file.downloadNameBase || file.name || file.downloadName || "claude-file");
-    const key = name.toLowerCase();
-    const count = used.get(key) || 0;
-    used.set(key, count + 1);
-    file.downloadName = count ? addFileNameSuffix(name, count + 1) : name;
+    const base = file.zipPath
+      ? sanitizeZipEntryName(file.zipPathBase || file.zipPath)
+      : sanitizeDownloadName(file.downloadNameBase || file.name || "claude-file");
+    let name = base;
+    let suffix = 2;
+    while (used.has(name.toLowerCase())) name = addFileNameSuffix(base, suffix++);
+    used.add(name.toLowerCase());
+    if (file.zipPath) {
+      file.zipPathBase = base;
+      file.zipPath = name;
+    }
+    file.downloadName = name;
   }
 }
 
@@ -640,6 +778,7 @@ function inferClaudeArtifactMime(input) {
 }
 
 async function fetchClaudeDownloadEntry(file, rateLimitGate = null) {
+  if (file.error) throw new Error(file.error);
   if (file.content !== undefined) {
     const bytes = new TextEncoder().encode(String(file.content));
     return {
@@ -651,7 +790,7 @@ async function fetchClaudeDownloadEntry(file, rateLimitGate = null) {
   }
 
   const response = await fetchClaudeWithRetry(file.url, {
-    credentials: "include",
+    credentials: file.credentials || "include",
     headers: {
       Accept: "*/*"
     }
