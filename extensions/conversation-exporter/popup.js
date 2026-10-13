@@ -1,5 +1,6 @@
 const CHATGPT_CONVERSATION_PATH_RE = /(?:^|\/)c\/[0-9a-f-]{36}(?:\/|$)/i;
 const CLAUDE_ID_RE = /^[0-9a-f-]{16,}$/i;
+const EXPORT_MODE_BUNDLE = "conversation-and-files";
 const CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
 const CHATGPT_EXPORT_MODE_ALL = "all-branches";
 const CHATGPT_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
@@ -133,6 +134,14 @@ async function initializePopup() {
   await initializeClaudeButtons(tab, target);
 }
 
+function makeBundleButton(tab, target) {
+  return {
+    label: "Download history + all files (ZIP)",
+    variant: "secondary",
+    onClick: () => runExport(tab, target, EXPORT_MODE_BUNDLE)
+  };
+}
+
 async function initializeChatGptButtons(tab, target) {
   setStatus("Checking ChatGPT branches...");
   renderDisabledButton();
@@ -166,7 +175,8 @@ async function initializeChatGptButtons(tab, target) {
         variant: "secondary",
         onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_ALL)
       },
-      downloadFilesButton
+      downloadFilesButton,
+      makeBundleButton(tab, target)
     ]);
     setStatus(formatChatGptReadyStatus(probe));
     return;
@@ -184,14 +194,15 @@ async function initializeChatGptButtons(tab, target) {
         variant: "secondary",
         disabled: fileCount <= 0,
         onClick: fileCount > 0 ? () => runExport(tab, target, CHATGPT_EXPORT_MODE_DOWNLOAD_FILES) : null
-      }
+      },
+      makeBundleButton(tab, target)
     ]);
     setStatus(formatChatGptReadyStatus(probe));
   } else {
     renderButtons([{
       label: "Export conversation",
       onClick: () => runExport(tab, target, CHATGPT_EXPORT_MODE_CURRENT)
-    }]);
+    }, makeBundleButton(tab, target)]);
     setStatus("Ready. Branch detection unavailable.");
   }
 }
@@ -229,7 +240,8 @@ async function initializeClaudeButtons(tab, target) {
         variant: "secondary",
         onClick: () => runExport(tab, target, CLAUDE_EXPORT_MODE_ALL)
       },
-      downloadFilesButton
+      downloadFilesButton,
+      makeBundleButton(tab, target)
     ]);
     setStatus(formatClaudeReadyStatus(probe));
     return;
@@ -240,7 +252,8 @@ async function initializeClaudeButtons(tab, target) {
       label: "Export conversation",
       onClick: () => runExport(tab, target, CLAUDE_EXPORT_MODE_CURRENT)
     },
-    downloadFilesButton
+    downloadFilesButton,
+    makeBundleButton(tab, target)
   ]);
 
   if (probe && probe.ok) {
@@ -300,12 +313,13 @@ function setClaudeExportModeInPage(mode) {
 function formatSuccessStatus(result) {
   const counts = result.counts || {};
 
-  if (result.exportMode === CHATGPT_EXPORT_MODE_DOWNLOAD_FILES || result.exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
+  if (result.exportMode === EXPORT_MODE_BUNDLE || result.exportMode === CHATGPT_EXPORT_MODE_DOWNLOAD_FILES || result.exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
     const fileCount = Number.isFinite(counts.files) ? counts.files : 0;
     const downloaded = Number.isFinite(counts.downloaded) ? counts.downloaded : fileCount;
     const failed = Number.isFinite(counts.failed) ? counts.failed : 0;
     const failureNote = failed ? ` (${failed} failed)` : "";
-    return `Downloaded ${downloaded} of ${fileCount} files${failureNote}.`;
+    const historyNote = result.exportMode === EXPORT_MODE_BUNDLE ? `${counts.messages || 0} messages and ` : "";
+    return `Downloaded ${historyNote}${downloaded} of ${fileCount} files${failureNote}.`;
   }
 
   const messageCount = Number.isFinite(counts.messages) ? counts.messages : 0;

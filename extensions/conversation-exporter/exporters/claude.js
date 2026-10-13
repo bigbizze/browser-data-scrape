@@ -1,6 +1,7 @@
 var CLAUDE_EXPORT_MODE_CURRENT = "current-branch";
 var CLAUDE_EXPORT_MODE_ALL = "all-branches";
 var CLAUDE_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
+var CLAUDE_EXPORT_MODE_BUNDLE = "conversation-and-files";
 var CLAUDE_BRANCH_STRUCTURE = "segment-tree";
 var CLAUDE_ROOT_PARENT_UUID = "00000000-0000-4000-8000-000000000000";
 var CLAUDE_FILE_DOWNLOAD_CONCURRENCY = 10;
@@ -40,6 +41,7 @@ var CLAUDE_FILE_DOWNLOAD_CONCURRENCY = 10;
 })();
 
 function normalizeClaudeExportMode(mode) {
+  if (mode === CLAUDE_EXPORT_MODE_BUNDLE) return CLAUDE_EXPORT_MODE_BUNDLE;
   if (mode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) return CLAUDE_EXPORT_MODE_DOWNLOAD_FILES;
   return mode === CLAUDE_EXPORT_MODE_ALL ? CLAUDE_EXPORT_MODE_ALL : CLAUDE_EXPORT_MODE_CURRENT;
 }
@@ -56,8 +58,10 @@ async function exportClaudeConversation(exportMode) {
   for (const orgId of orgIds) {
     try {
       const data = await fetchClaudeConversation(orgId, conversationId);
-      if (exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
-        return downloadClaudeConversationFiles(data, conversationId, orgId);
+      if (exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES || exportMode === CLAUDE_EXPORT_MODE_BUNDLE) {
+        const history = exportMode === CLAUDE_EXPORT_MODE_BUNDLE
+          ? buildClaudeAllBranchesExport(data, conversationId, orgId) : null;
+        return downloadClaudeConversationFiles(data, conversationId, orgId, history);
       }
 
       const out = exportMode === CLAUDE_EXPORT_MODE_ALL
@@ -74,7 +78,7 @@ async function exportClaudeConversation(exportMode) {
     }
   }
 
-  if (exportMode === CLAUDE_EXPORT_MODE_ALL) {
+  if (exportMode === CLAUDE_EXPORT_MODE_ALL || exportMode === CLAUDE_EXPORT_MODE_BUNDLE) {
     const reason = apiError && apiError.message ? ` Last API error: ${apiError.message}` : "";
     throw new Error(`Claude API all-branches export failed.${reason}`);
   }
@@ -224,7 +228,7 @@ async function fetchClaudeWiggleFiles(conversationId, orgId) {
   return data;
 }
 
-async function downloadClaudeConversationFiles(data, conversationId, orgId) {
+async function downloadClaudeConversationFiles(data, conversationId, orgId, history = null) {
   const files = collectClaudeDownloadableFiles(data, conversationId, orgId);
   let workspaceListError = null;
   await addClaudePublishedArtifactFiles(files, data, orgId);
@@ -233,35 +237,37 @@ async function downloadClaudeConversationFiles(data, conversationId, orgId) {
     addClaudeWiggleFiles(files, await fetchClaudeWiggleFiles(conversationId, orgId), conversationId, orgId);
   } catch (error) {
     workspaceListError = error;
+    if (history) history.warnings = [...(history.warnings || []), `Workspace file discovery failed: ${error.message || error}`];
     console.warn("[claude-export] Workspace file list unavailable", error);
   }
 
-  if (!files.length) {
+  if (!files.length && !history) {
     const reason = workspaceListError && workspaceListError.message ? ` ${workspaceListError.message}` : "";
     throw new Error(`No downloadable Claude files found in this conversation.${reason}`);
   }
 
-  const archiveName = makeClaudeFilesArchiveName(data, conversationId);
-  const downloadResult = await downloadClaudeFilesToZip(files, archiveName);
+  const archiveName = makeClaudeFilesArchiveName(data, conversationId).replace(/-files\.zip$/, history ? "-complete.zip" : "-files.zip");
+  const downloadResult = await downloadClaudeFilesToZip(files, archiveName, history);
   const results = downloadResult.results;
 
   const failures = results.filter((result) => !result.ok);
   const successful = results.filter((result) => result.ok);
   const downloaded = successful.length;
-  if (!downloaded && failures.length) {
+  if (!history && !downloaded && failures.length) {
     throw new Error(`Failed to download ${failures.length} Claude files. First error: ${failures[0].error}`);
   }
 
   const out = {
     exportedAt: new Date().toISOString(),
     source: "claude-api-files",
-    exportMode: CLAUDE_EXPORT_MODE_DOWNLOAD_FILES,
+    exportMode: history ? CLAUDE_EXPORT_MODE_BUNDLE : CLAUDE_EXPORT_MODE_DOWNLOAD_FILES,
     url: location.href,
     conversationId: data.uuid || conversationId,
     organizationId: orgId,
     title: data.name || document.title || "Claude conversation",
     counts: {
-      messages: Array.isArray(data.chat_messages) ? data.chat_messages.length : 0,
+      messages: history ? history.totalCounts.messages : (Array.isArray(data.chat_messages) ? data.chat_messages.length : 0),
+      ...(history ? { leafBranches: history.totalCounts.leafBranches } : {}),
       files: files.length,
       downloaded,
       failed: failures.length
@@ -276,8 +282,9 @@ async function downloadClaudeConversationFiles(data, conversationId, orgId) {
   return out;
 }
 
-async function downloadClaudeFilesToZip(files, archiveName) {
+async function downloadClaudeFilesToZip(files, archiveName, history = null) {
   const zip = createZipAccumulator();
+  if (history) await addJsonZipEntry(zip, "conversation.json", history);
   const results = [];
   const rateLimitGate = createClaudeRateLimitGate();
   let nextIndex = 0;
@@ -289,7 +296,7 @@ async function downloadClaudeFilesToZip(files, archiveName) {
       try {
         const entry = await fetchClaudeDownloadEntry(file, rateLimitGate);
         await zip.addEntry({
-          name: file.zipPath || file.downloadName || entry.name,
+          name: (history ? "files/" : "") + (file.zipPath || file.downloadName || entry.name),
           parts: entry.parts,
           size: entry.size,
           crc: entry.crc,
@@ -1902,4 +1909,9 @@ function downloadJson(data, downloadName) {
   link.remove();
 
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function addJsonZipEntry(zip, name, data) {
+  const bytes = new TextEncoder().encode(JSON.stringify(data, null, 2));
+  await zip.addEntry({ name, parts: [bytes], size: bytes.length, crc: crc32(bytes), lastModified: new Date() });
 }

@@ -1279,3 +1279,89 @@ test("Claude ZIP preserves unique names despite identical response filenames and
   assert.deepEqual(names, ["same.html", "same (2).html", "same (2) (2).html", "export-failures.json"]);
   assert.match(bytes.toString(), /Artifact unavailable/);
 });
+
+async function readStoredZip(blob) {
+  const bytes = Buffer.from(await blob.arrayBuffer());
+  const entries = new Map();
+  for (let offset = 0; bytes.readUInt32LE(offset) === 0x04034b50;) {
+    const nameLength = bytes.readUInt16LE(offset + 26);
+    const extraLength = bytes.readUInt16LE(offset + 28);
+    const size = bytes.readUInt32LE(offset + 18);
+    const name = bytes.subarray(offset + 30, offset + 30 + nameLength).toString();
+    const start = offset + 30 + nameLength + extraLength;
+    assert.equal(entries.has(name), false, `Duplicate ZIP path: ${name}`);
+    entries.set(name, bytes.subarray(start, start + size));
+    offset = start + size;
+  }
+  return entries;
+}
+
+for (const provider of ["chatgpt", "claude"]) {
+  for (const scenario of ["files", "empty", "failed"]) {
+    test(`${provider} combined export saves all branches in one ZIP with ${scenario} downloads`, async () => {
+      const sandbox = provider === "chatgpt" ? loadChatGptExporter() : loadClaudeExporter();
+      sandbox.setTimeout = callback => { callback(); return 0; };
+      const downloads = [];
+      sandbox.downloadBlob = (blob, name) => downloads.push({ blob, name });
+      sandbox.downloadJson = () => assert.fail("Combined export must not download separate JSON");
+      sandbox.console = { ...console, warn() {} };
+      sandbox.fetch = async () => scenario === "failed"
+        ? new Response("unavailable", { status: 404 }) : new Response("attachment bytes");
+      let result;
+      if (provider === "chatgpt") {
+        sandbox.getAccessToken = async () => "token";
+        sandbox.fetchChatGptConversation = async () => ({ title: "Bundle", current_node: "left", mapping: {
+          root: node("root", null, ["left", "right"]),
+          left: node("left", "root", []), right: node("right", "root", [])
+        } });
+        sandbox.fetchChatGptConversationFiles = async () => ({ items: scenario === "empty" ? [] : [
+          { file_id: "file1", file_name: "conversation.json" }
+        ] });
+        result = await sandbox.exportChatBackend(sandbox.normalizeChatGptExportMode("conversation-and-files"));
+      } else {
+        sandbox.getClaudeOrgIds = async () => ["org"];
+        sandbox.fetchClaudeWiggleFiles = async () => ({ files: [] });
+        sandbox.fetchClaudeConversation = async () => ({ name: "Bundle", chat_messages: [
+          claudeMessage("root", "human"),
+          claudeMessage("left", "assistant", { parent_message_uuid: "root", generated_files: scenario === "empty" ? [] : [
+            { id: "file1", filename: "conversation.json", download_url: "/download/file1" }
+          ] }),
+          claudeMessage("right", "assistant", { parent_message_uuid: "root" })
+        ] });
+        result = await sandbox.exportClaudeConversation(sandbox.normalizeClaudeExportMode("conversation-and-files"));
+      }
+      assert.equal(downloads.length, 1);
+      assert.match(downloads[0].name, /-complete\.zip$/);
+      assert.equal(result.exportMode, "conversation-and-files");
+      assert.equal(result.counts.messages, 3);
+      assert.equal(result.counts.failed, scenario === "failed" ? 1 : 0);
+      const entries = await readStoredZip(downloads[0].blob);
+      const history = JSON.parse(entries.get("conversation.json").toString());
+      assert.equal(history.exportMode, "all-branches");
+      assert.equal(history.branches.length, 2);
+      if (scenario === "files") assert.equal(entries.get("files/conversation.json").toString(), "attachment bytes");
+      if (scenario === "empty") assert.equal(entries.size, 1);
+      if (scenario === "failed") assert.match(entries.get("export-failures.json").toString(), /404/);
+    });
+  }
+}
+
+test("Combined ZIP button stays enabled with empty or unavailable file probes", async () => {
+  const popup = loadPopup();
+  await Promise.resolve();
+  for (const provider of ["chatgpt", "claude"]) {
+    for (const probe of [{ ok: true, fileCount: 0 }, { ok: true, hasBranches: true, fileCount: 1 }, { ok: false }]) {
+      let buttons;
+      let selectedMode;
+      popup.renderButtons = value => { buttons = value; };
+      popup.chrome.scripting.executeScript = async () => [{ result: probe }];
+      popup.runExport = (tab, target, mode) => { selectedMode = mode; };
+      await popup[provider === "chatgpt" ? "initializeChatGptButtons" : "initializeClaudeButtons"]({ id: 1 }, { type: provider });
+      const bundle = buttons.find(button => button.label === "Download history + all files (ZIP)");
+      assert.ok(bundle);
+      assert.equal(Boolean(bundle.disabled), false);
+      bundle.onClick();
+      assert.equal(selectedMode, "conversation-and-files");
+    }
+  }
+});

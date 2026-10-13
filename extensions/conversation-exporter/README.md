@@ -17,6 +17,8 @@ Unpacked Chromium extension for exporting ChatGPT or Claude conversations and do
 
 Conversation exports use JSON. File downloads use one ZIP archive.
 
+Use **Download history + all files (ZIP)** for one archive with `conversation.json` (all branches) and a `files/` folder. The button also works for conversations without files. If individual downloads fail, the ZIP keeps the history and lists failures in `export-failures.json`.
+
 ## Notes
 
 - ChatGPT exports use the private `/api/auth/session` and `/backend-api/conversation/<id>` endpoints through your existing logged-in browser session.

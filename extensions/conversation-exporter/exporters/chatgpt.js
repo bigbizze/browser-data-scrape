@@ -1,6 +1,7 @@
 var CHATGPT_EXPORT_MODE_CURRENT = "current-branch";
 var CHATGPT_EXPORT_MODE_ALL = "all-branches";
 var CHATGPT_EXPORT_MODE_DOWNLOAD_FILES = "download-files-all";
+var CHATGPT_EXPORT_MODE_BUNDLE = "conversation-and-files";
 var CHATGPT_BRANCH_STRUCTURE = "segment-tree";
 var CHATGPT_FILE_DOWNLOAD_CONCURRENCY = 10;
 
@@ -39,6 +40,7 @@ var CHATGPT_FILE_DOWNLOAD_CONCURRENCY = 10;
 })();
 
 function normalizeChatGptExportMode(mode) {
+  if (mode === CHATGPT_EXPORT_MODE_BUNDLE) return CHATGPT_EXPORT_MODE_BUNDLE;
   if (mode === CHATGPT_EXPORT_MODE_DOWNLOAD_FILES) return CHATGPT_EXPORT_MODE_DOWNLOAD_FILES;
   return mode === CHATGPT_EXPORT_MODE_ALL ? CHATGPT_EXPORT_MODE_ALL : CHATGPT_EXPORT_MODE_CURRENT;
 }
@@ -54,6 +56,9 @@ async function exportChatBackend(exportMode) {
   }
 
   const conv = await fetchChatGptConversation(convId);
+  if (exportMode === CHATGPT_EXPORT_MODE_BUNDLE) {
+    return downloadChatGptConversationFiles(convId, buildChatGptAllBranchesExport(conv, convId));
+  }
   const out = exportMode === CHATGPT_EXPORT_MODE_ALL
     ? buildChatGptAllBranchesExport(conv, convId)
     : await buildChatGptCurrentBranchExport(conv, convId);
@@ -93,33 +98,34 @@ async function fetchChatGptConversation(convId) {
   return conv;
 }
 
-async function downloadChatGptConversationFiles(conversationId) {
+async function downloadChatGptConversationFiles(conversationId, history = null) {
   const token = await getAccessToken();
   const listData = await fetchChatGptConversationFiles(conversationId, token);
   const files = collectChatGptConversationFiles(listData, conversationId);
 
-  if (!files.length) {
+  if (!files.length && !history) {
     throw new Error("No downloadable ChatGPT files found in this conversation.");
   }
 
-  const archiveName = makeChatGptFilesArchiveName(conversationId);
-  const downloadResult = await downloadChatGptFilesToZip(files, archiveName, token);
+  const archiveName = makeChatGptFilesArchiveName(conversationId).replace(/-files\.zip$/, history ? "-complete.zip" : "-files.zip");
+  const downloadResult = await downloadChatGptFilesToZip(files, archiveName, token, history);
   const failures = downloadResult.results.filter((result) => !result.ok);
   const successful = downloadResult.results.filter((result) => result.ok);
   const downloaded = successful.length;
 
-  if (!downloaded && failures.length) {
+  if (!history && !downloaded && failures.length) {
     throw new Error(`Failed to download ${failures.length} ChatGPT files. First error: ${failures[0].error}`);
   }
 
   const out = {
     exportedAt: new Date().toISOString(),
     source: "chatgpt-api-files",
-    exportMode: CHATGPT_EXPORT_MODE_DOWNLOAD_FILES,
+    exportMode: history ? CHATGPT_EXPORT_MODE_BUNDLE : CHATGPT_EXPORT_MODE_DOWNLOAD_FILES,
     url: location.href,
     conversationId,
     title: document.title || "ChatGPT conversation",
     counts: {
+      ...(history ? { messages: history.totalCounts.messages, leafBranches: history.totalCounts.leafBranches } : {}),
       files: files.length,
       downloaded,
       failed: failures.length
@@ -207,8 +213,9 @@ function getChatGptConversationFileKey(file) {
   return `meta:${file.name || ""}:${file.size || ""}:${file.mime || ""}`;
 }
 
-async function downloadChatGptFilesToZip(files, archiveName, token) {
+async function downloadChatGptFilesToZip(files, archiveName, token, history = null) {
   const zip = createZipAccumulator();
+  if (history) await addJsonZipEntry(zip, "conversation.json", history);
   const results = [];
   const rateLimitGate = createChatGptRateLimitGate();
   let nextIndex = 0;
@@ -220,7 +227,7 @@ async function downloadChatGptFilesToZip(files, archiveName, token) {
       try {
         const entry = await fetchChatGptDownloadEntry(file, token, rateLimitGate);
         await zip.addEntry({
-          name: entry.name,
+          name: history ? `files/${entry.name}` : entry.name,
           parts: entry.parts,
           size: entry.size,
           crc: entry.crc,
@@ -243,6 +250,12 @@ async function downloadChatGptFilesToZip(files, archiveName, token) {
 
   await Promise.all(workers);
 
+  if (history) {
+    const failures = results.filter((result) => !result.ok);
+    if (failures.length) await addJsonZipEntry(zip, "export-failures.json", failures.map(({ file, error }) => ({
+      name: file.downloadName, error
+    })));
+  }
   if (zip.count > 0) {
     downloadBlob(zip.toBlob(), archiveName);
   }
@@ -1302,4 +1315,9 @@ function downloadJson(data, downloadName) {
   link.remove();
 
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function addJsonZipEntry(zip, name, data) {
+  const bytes = new TextEncoder().encode(JSON.stringify(data, null, 2));
+  await zip.addEntry({ name, parts: [bytes], size: bytes.length, crc: crc32(bytes), lastModified: new Date() });
 }
