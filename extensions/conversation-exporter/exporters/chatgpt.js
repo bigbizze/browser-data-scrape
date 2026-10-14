@@ -215,6 +215,8 @@ function getChatGptConversationFileKey(file) {
 
 async function downloadChatGptFilesToZip(files, archiveName, token, history = null) {
   const zip = createZipAccumulator();
+  reserveConversationBundlePaths(files, history);
+  await addConversationBundleDocs(zip, 'chatgpt', history);
   if (history) await addJsonZipEntry(zip, "conversation.json", history);
   const results = [];
   const rateLimitGate = createChatGptRateLimitGate();
@@ -250,7 +252,7 @@ async function downloadChatGptFilesToZip(files, archiveName, token, history = nu
 
   await Promise.all(workers);
 
-  if (history) {
+  {
     const failures = results.filter((result) => !result.ok);
     if (failures.length) await addJsonZipEntry(zip, "export-failures.json", failures.map(({ file, error }) => ({
       name: file.downloadName, error
@@ -599,7 +601,8 @@ function createZipAccumulator() {
       const parts = await normalizeZipEntryParts(entry);
       const size = Number.isFinite(entry.size) ? entry.size : parts.reduce((total, part) => total + part.length, 0);
       const crc = Number.isFinite(entry.crc) ? entry.crc : crc32Parts(parts);
-      appendZipEntry(entry, parts, size, crc);
+      const packed = await compressConversationZipParts(parts, size, entry.name);
+      appendZipEntry(entry, packed.parts, size, crc, packed.method, packed.compressedSize);
     },
 
     toBlob() {
@@ -607,7 +610,7 @@ function createZipAccumulator() {
     }
   };
 
-  function appendZipEntry(entry, parts, size, crc) {
+  function appendZipEntry(entry, parts, size, crc, method, compressedSize) {
     const nameBytes = new TextEncoder().encode(sanitizeZipEntryName(entry.name));
     const time = getZipDosTime(entry.lastModified || new Date());
     const date = getZipDosDate(entry.lastModified || new Date());
@@ -617,11 +620,11 @@ function createZipAccumulator() {
     localView.setUint32(0, 0x04034b50, true);
     localView.setUint16(4, 20, true);
     localView.setUint16(6, 0x0800, true);
-    localView.setUint16(8, 0, true);
+    localView.setUint16(8, method, true);
     localView.setUint16(10, time, true);
     localView.setUint16(12, date, true);
     localView.setUint32(14, crc, true);
-    localView.setUint32(18, size, true);
+    localView.setUint32(18, compressedSize, true);
     localView.setUint32(22, size, true);
     localView.setUint16(26, nameBytes.length, true);
     localView.setUint16(28, 0, true);
@@ -633,11 +636,11 @@ function createZipAccumulator() {
     centralView.setUint16(4, 20, true);
     centralView.setUint16(6, 20, true);
     centralView.setUint16(8, 0x0800, true);
-    centralView.setUint16(10, 0, true);
+    centralView.setUint16(10, method, true);
     centralView.setUint16(12, time, true);
     centralView.setUint16(14, date, true);
     centralView.setUint32(16, crc, true);
-    centralView.setUint32(20, size, true);
+    centralView.setUint32(20, compressedSize, true);
     centralView.setUint32(24, size, true);
     centralView.setUint16(28, nameBytes.length, true);
     centralView.setUint16(30, 0, true);
@@ -650,7 +653,7 @@ function createZipAccumulator() {
 
     localParts.push(localHeader, ...parts);
     centralParts.push(centralHeader);
-    offset += localHeader.length + size;
+    offset += localHeader.length + compressedSize;
     count++;
   }
 

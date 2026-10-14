@@ -213,6 +213,8 @@ async function initializeClaudeButtons(tab, target) {
 
   let probe = null;
   try {
+    await chrome.scripting.executeScript({target:{tabId:tab.id}, func:() => { window.__claudeInventoryOnly = true; }});
+    await chrome.scripting.executeScript({target:{tabId:tab.id}, files:['exporters/claude.js']});
     probe = getResult(await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: probeClaudeConversationInPage
@@ -286,7 +288,7 @@ async function runExport(tab, target, mode = null) {
 
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      files: [target.script]
+      files: ["exporters/bundle-docs.js", target.script]
     });
 
     const result = getResult(results);
@@ -307,11 +309,15 @@ function setChatGptExportModeInPage(mode) {
 }
 
 function setClaudeExportModeInPage(mode) {
+  delete window.__claudeInventoryOnly;
   window.__claudeExportMode = mode;
 }
 
 function formatSuccessStatus(result) {
   const counts = result.counts || {};
+  if (result.source === 'claude-api-files') {
+    return `Exported ${counts.downloaded || 0} of ${counts.files || 0} items, including ${counts.versions || 0} artifact versions. ${counts.failed || 0} unresolved items; ${counts.discoveryFailures || 0} discovery failures; ${counts.cleanupFailures || 0} cleanup failures.`;
+  }
 
   if (result.exportMode === EXPORT_MODE_BUNDLE || result.exportMode === CHATGPT_EXPORT_MODE_DOWNLOAD_FILES || result.exportMode === CLAUDE_EXPORT_MODE_DOWNLOAD_FILES) {
     const fileCount = Number.isFinite(counts.files) ? counts.files : 0;
@@ -334,13 +340,14 @@ function formatSuccessStatus(result) {
 
 function formatClaudeReadyStatus(probe) {
   const parts = ["Ready."];
+  if (probe.fileProbeWarning) parts.push(probe.fileProbeWarning);
 
   if (probe.branchPoints > 0) {
     parts.push(`Found ${probe.branchPoints} branch ${probe.branchPoints === 1 ? "point" : "points"}.`);
   }
 
   if (probe.fileCount > 0) {
-    parts.push(`Found ${probe.fileCount} downloadable ${probe.fileCount === 1 ? "file" : "files"}.`);
+    parts.push(`Found ${probe.fileCount} file ${probe.fileCount === 1 ? "candidate" : "candidates"}.`);
   }
 
   return parts.join(" ");
@@ -588,345 +595,19 @@ function unique(values) {
 }
 
 async function probeClaudeConversationInPage() {
-  const rootParentUuid = "00000000-0000-4000-8000-000000000000";
   const conversationId = getConversationId();
-  if (!conversationId) {
-    return { ok: false, error: "No Claude conversation id found in the URL." };
-  }
-
-  let lastError = null;
-  const orgIds = await getClaudeOrgIds();
-
-  for (const orgId of orgIds) {
+  let lastError;
+  for (const orgId of await getClaudeOrgIds()) {
     try {
       const data = await fetchClaudeConversation(orgId, conversationId);
-      const stats = getClaudeBranchStats(data.chat_messages || []);
-      const seenFiles = new Set();
-      let fileCount = getClaudeDownloadableFileCount(data.chat_messages || [], orgId, conversationId, seenFiles);
-      let fileProbeWarning = null;
+      const inventory = buildClaudeInventory(data, conversationId, orgId);
 
-      try {
-        fileCount += getClaudeWorkspaceFileCount(
-          await fetchClaudeWiggleFiles(orgId, conversationId),
-          seenFiles
-        );
-      } catch (error) {
-        fileProbeWarning = error && error.message ? error.message : String(error);
-        console.warn("[conversation-exporter] Claude workspace file probe failed", error);
-      }
-
-      return {
-        ok: true,
-        hasBranches: stats.branchPoints > 0,
-        branchPoints: stats.branchPoints,
-        branchedChildren: stats.branchedChildren,
-        hasFiles: fileCount > 0,
-        fileCount,
-        fileProbeWarning
-      };
-    } catch (error) {
-      lastError = error;
-    }
+      return {ok:true, hasBranches:inventory.history.totalCounts.branchPoints > 0,
+        branchPoints:inventory.history.totalCounts.branchPoints, fileCount:inventory.files.length + inventory.artifacts.length,
+        fileProbeWarning:'Counts are preliminary. Versions and workspace files are checked during export.'};
+    } catch (error) { lastError = error; }
   }
-
-  return {
-    ok: false,
-    error: lastError && lastError.message ? lastError.message : "Could not inspect Claude branches."
-  };
-
-  function getConversationId() {
-    const parts = location.pathname.split("/").filter(Boolean);
-    const chatIndex = parts.indexOf("chat");
-    if (chatIndex >= 0 && parts[chatIndex + 1]) {
-      return decodeURIComponent(parts[chatIndex + 1]);
-    }
-
-    const lastPart = parts[parts.length - 1] || "";
-    return /^[0-9a-f-]{16,}$/i.test(lastPart) ? decodeURIComponent(lastPart) : null;
-  }
-
-  async function getClaudeOrgIds() {
-    const ids = [];
-
-    addUnique(ids, getOrgIdFromCookie());
-
-    try {
-      const response = await fetch(`${location.origin}/api/organizations`, {
-        credentials: "include",
-        headers: {
-          Accept: "application/json"
-        }
-      });
-
-      if (response.ok) {
-        addUniqueMany(ids, extractOrgIds(await response.json()));
-      }
-    } catch (error) {
-      // The caller will fall back to any ids found from cookies.
-    }
-
-    return ids;
-  }
-
-  function getOrgIdFromCookie() {
-    const match = document.cookie.match(/(?:^|;\s*)lastActiveOrg=([^;]+)/);
-    if (!match) return null;
-
-    try {
-      return decodeURIComponent(match[1]).replace(/^"|"$/g, "");
-    } catch (error) {
-      return match[1].replace(/^"|"$/g, "");
-    }
-  }
-
-  function extractOrgIds(data) {
-    const ids = [];
-    const collections = [];
-
-    if (Array.isArray(data)) collections.push(data);
-    if (data && Array.isArray(data.organizations)) collections.push(data.organizations);
-    if (data && Array.isArray(data.data)) collections.push(data.data);
-    if (data && Array.isArray(data.results)) collections.push(data.results);
-
-    for (const collection of collections) {
-      for (const item of collection) {
-        if (typeof item === "string") {
-          addUnique(ids, item);
-        } else if (item && typeof item === "object") {
-          addUnique(ids, item.uuid);
-          addUnique(ids, item.id);
-          addUnique(ids, item.organization_uuid);
-          addUnique(ids, item.organization_id);
-          if (item.organization && typeof item.organization === "object") {
-            addUnique(ids, item.organization.uuid);
-            addUnique(ids, item.organization.id);
-          }
-        }
-      }
-    }
-
-    return ids;
-  }
-
-  function addUnique(list, value) {
-    const clean = typeof value === "string" ? value.trim() : "";
-    if (clean && !list.includes(clean)) list.push(clean);
-  }
-
-  function addUniqueMany(list, values) {
-    for (const value of values || []) addUnique(list, value);
-  }
-
-  async function fetchClaudeConversation(orgId, conversationId) {
-    const url = `${location.origin}/api/organizations/${encodeURIComponent(orgId)}`
-      + `/chat_conversations/${encodeURIComponent(conversationId)}`
-      + "?tree=True&rendering_mode=messages&render_all_tools=true&consistency=strong";
-
-    const response = await fetchClaudeWithRetry(url, {
-      credentials: "include",
-      headers: {
-        Accept: "application/json"
-      }
-    }, "Conversation");
-
-    if (!response.ok) {
-      throw new Error(`Conversation request failed with HTTP ${response.status}.`);
-    }
-
-    const data = await response.json();
-    if (!data || !Array.isArray(data.chat_messages)) {
-      throw new Error("Unexpected Claude response with no chat_messages array.");
-    }
-
-    return data;
-  }
-
-  async function fetchClaudeWiggleFiles(orgId, conversationId) {
-    const url = `${location.origin}/api/organizations/${encodeURIComponent(orgId)}`
-      + `/conversations/${encodeURIComponent(conversationId)}`
-      + "/wiggle/list-files?prefix=";
-
-    const response = await fetchClaudeWithRetry(url, {
-      credentials: "include",
-      headers: {
-        Accept: "application/json"
-      }
-    }, "Workspace file list");
-
-    const data = await response.json();
-    if (!data || !Array.isArray(data.files)) {
-      throw new Error("Unexpected Claude workspace file list response.");
-    }
-
-    return data;
-  }
-
-  async function fetchClaudeWithRetry(url, init, label) {
-    let lastResponse = null;
-
-    for (let attempt = 0; attempt <= 10; attempt++) {
-      const response = await fetch(url, init);
-      if (response.ok) return response;
-
-      lastResponse = response;
-      if (response.status !== 429 || attempt >= 10) break;
-      await sleep(getClaudeRetryDelayMs(response, attempt));
-    }
-
-    if (lastResponse && lastResponse.status === 429) {
-      const retryAfter = lastResponse.headers && lastResponse.headers.get("retry-after");
-      throw new Error(`${label} request was rate limited by Claude${retryAfter ? `; retry after ${retryAfter}` : ""}.`);
-    }
-
-    throw new Error(`${label} request failed with HTTP ${lastResponse ? lastResponse.status : "unknown"}.`);
-  }
-
-  function getClaudeRetryDelayMs(response, attempt) {
-    const retryAfter = response && response.headers ? response.headers.get("retry-after") : "";
-    const numeric = Number(retryAfter);
-    if (Number.isFinite(numeric) && numeric > 0) {
-      return Math.min(Math.max(numeric * 1000, 3000), 20000);
-    }
-
-    const parsedDate = Date.parse(retryAfter || "");
-    if (Number.isFinite(parsedDate)) return Math.min(Math.max(parsedDate - Date.now(), 3000), 20000);
-
-    return Math.min(Math.max(3000 * Math.pow(2, attempt), 3000), 20000);
-  }
-
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  function getClaudeBranchStats(messages) {
-    const childrenByParent = new Map();
-    const seenUuids = new Set();
-
-    for (const message of messages) {
-      if (!message || !message.uuid || !normalizeClaudeRole(message.sender)) continue;
-      if (seenUuids.has(message.uuid)) continue;
-      seenUuids.add(message.uuid);
-
-      const parentId = getClaudeParentId(message) || "";
-      if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
-      childrenByParent.get(parentId).push(message.uuid);
-    }
-
-    let branchPoints = 0;
-    let branchedChildren = 0;
-    for (const children of childrenByParent.values()) {
-      if (children.length > 1) {
-        branchPoints++;
-        branchedChildren += children.length;
-      }
-    }
-
-    return { branchPoints, branchedChildren };
-  }
-
-  function getClaudeParentId(message) {
-    const parentId = message && message.parent_message_uuid;
-    return !parentId || parentId === rootParentUuid ? null : parentId;
-  }
-
-  function normalizeClaudeRole(sender) {
-    if (sender === "human" || sender === "user") return "user";
-    if (sender === "assistant" || sender === "claude") return "assistant";
-    return null;
-  }
-
-  function getClaudeDownloadableFileCount(messages, orgId, convId, seen) {
-    let count = 0;
-
-    for (const message of messages) {
-      if (!message || typeof message !== "object") continue;
-
-      const candidates = []
-        .concat(getArray(message.attachments).map((file) => ({ file, source: "attachment" })))
-        .concat(getArray(message.files).map((file) => ({ file, source: "files" })))
-        .concat(getArray(message.files_v2).map((file) => ({ file, source: "files_v2" })))
-        .concat(getArray(message.generated_files).map((file) => ({ file, source: "generated_files" })));
-
-      for (const candidate of candidates) {
-        const key = getClaudeFileKey(candidate.file, candidate.source);
-        if (!key || seen.has(key)) continue;
-        if (!hasClaudeDownloadMethod(candidate.file, candidate.source, orgId, convId)) continue;
-        seen.add(key);
-        count++;
-      }
-
-      for (const artifact of getClaudeArtifactContentFiles(message)) {
-        const key = `artifact:${artifact.id}:${artifact.name}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        count++;
-      }
-    }
-
-    return count;
-  }
-
-  function getClaudeWorkspaceFileCount(listData, seen) {
-    let count = 0;
-
-    for (const path of getArray(listData && listData.files)) {
-      if (typeof path !== "string" || !path) continue;
-
-      const key = `binary:${path}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      count++;
-    }
-
-    return count;
-  }
-
-  function getArray(value) {
-    return Array.isArray(value) ? value : [];
-  }
-
-  function getClaudeFileKey(file, source) {
-    if (!file || typeof file !== "object") return "";
-    const id = file.file_uuid || file.uuid || file.id || file.file_id || file.path || file.url || file.preview_url || "";
-    const name = file.file_name || file.name || file.filename || "";
-
-    if (source === "attachment" && typeof file.extracted_content === "string") {
-      return `attachment:${id}:${name}`;
-    }
-
-    return id ? `binary:${id}` : `${source}:${name}`;
-  }
-
-  function hasClaudeDownloadMethod(file, source, orgId, convId) {
-    if (!file || typeof file !== "object") return false;
-    if (source === "attachment" && typeof file.extracted_content === "string") return true;
-    if (file.url || file.download_url || file.downloadUrl || file.preview_url || (file.document_asset && file.document_asset.url)) {
-      return true;
-    }
-    if (source === "files_v2" && file.path && orgId && convId) return true;
-    if (file.file_kind === "blob" && file.file_uuid && orgId) return true;
-    return Boolean(file.file_uuid && orgId && (file.file_name || file.name || file.filename));
-  }
-
-  function getClaudeArtifactContentFiles(message) {
-    const out = [];
-
-    for (const block of getArray(message.content)) {
-      if (!block || typeof block !== "object") continue;
-      const input = block.input && typeof block.input === "object" ? block.input : null;
-      if (!input) continue;
-
-      if (block.type === "tool_use" && (block.name === "artifacts" || block.name === "create_file") && typeof input.content === "string") {
-        out.push({
-          id: block.id || input.id || input.filename || input.title || "",
-          name: input.filename || input.title || "artifact",
-          content: input.content
-        });
-      }
-    }
-
-    return out;
-  }
+  return {ok:false, error:lastError?.message || 'Could not inspect Claude conversation'};
 }
 
 initializePopup().catch((error) => {

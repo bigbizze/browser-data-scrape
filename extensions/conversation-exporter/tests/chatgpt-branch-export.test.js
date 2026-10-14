@@ -31,8 +31,9 @@ function loadChatGptExporter() {
         };
       }
     },
-    console,
+    console: {log() {}, warn() {}, error() {}, table() {}},
     Blob,
+    crypto: require("node:crypto").webcrypto,
     TextEncoder,
     URL: TestURL,
     setTimeout,
@@ -42,6 +43,7 @@ function loadChatGptExporter() {
   };
 
   vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(extensionRoot, "exporters/bundle-docs.js"), "utf8"), sandbox);
   vm.runInContext(code, sandbox, { filename: "chatgpt.js" });
   return sandbox;
 }
@@ -71,8 +73,9 @@ function loadClaudeExporter() {
         };
       }
     },
-    console,
+    console: {log() {}, warn() {}, error() {}, table() {}},
     Blob,
+    crypto: require("node:crypto").webcrypto,
     TextEncoder,
     URL: TestURL,
     setTimeout,
@@ -82,6 +85,7 @@ function loadClaudeExporter() {
   };
 
   vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(extensionRoot, "exporters/bundle-docs.js"), "utf8"), sandbox);
   vm.runInContext(code, sandbox, { filename: "claude.js" });
   return sandbox;
 }
@@ -98,7 +102,7 @@ function loadPopup() {
     querySelectorAll: () => []
   };
   const sandbox = {
-    console,
+    console: {log() {}, warn() {}, error() {}, table() {}},
     URL,
     document: {
       getElementById(id) {
@@ -673,7 +677,7 @@ test("ChatGPT file downloader limits concurrent downloads to ten", async () => {
   assert.equal(maxActive, 10);
 
   while (completed < 12) {
-    while (!pending.length) await Promise.resolve();
+    while (!pending.length) await new Promise(setImmediate);
     pending.shift()();
     await Promise.resolve();
   }
@@ -760,7 +764,7 @@ test("ChatGPT file downloader pauses all workers during shared 429 backoff", asy
   assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 10);
 
   timers.shift().callback();
-  while (pending.length < 3) await Promise.resolve();
+  while (pending.length < 3) await new Promise(setImmediate);
   assert.equal(requested.filter((url) => url.includes("/backend-api/files/download/")).length, 13);
 
   while (pending.length) {
@@ -795,7 +799,8 @@ test("Claude downloadable file collector handles current file shapes", () => {
         files: [{
           file_uuid: "blob-file",
           file_name: "diagram.png",
-          file_kind: "blob",
+          file_kind: "image",
+          preview_url: "/resized-preview",
           mime_type: "image/png"
         }],
         files_v2: [{
@@ -1056,7 +1061,7 @@ test("Claude file downloader limits concurrent downloads to ten", async () => {
   assert.equal(maxActive, 10);
 
   while (completed < 12) {
-    while (!pending.length) await Promise.resolve();
+    while (!pending.length) await new Promise(setImmediate);
     const next = pending.shift();
     next();
     await Promise.resolve();
@@ -1141,7 +1146,7 @@ test("Claude file downloader pauses all workers during shared 429 backoff", asyn
   assert.equal(requested.filter((url) => url.includes("/download/")).length, 10);
 
   timers.shift().callback();
-  while (pending.length < 3) await Promise.resolve();
+  while (pending.length < 3) await new Promise(setImmediate);
   assert.equal(requested.filter((url) => url.includes("/download/")).length, 13);
 
   while (pending.length) {
@@ -1247,7 +1252,7 @@ test("Claude published artifact export fetches source bytes and preserves suppor
     { text: "https://claude.ai/artifact/demo" }
   ] }] }, "org");
   assert.equal(files.length, 2);
-  assert.equal(files[1].zipPath, "artifacts/demo/styles/main.css");
+  assert.equal(files[1].zipPath, `artifacts/${uuid}/v1/styles/main.css`);
   const entry = await claude.fetchClaudeDownloadEntry(files[0]);
   assert.equal(Buffer.concat(entry.parts.map(Buffer.from)).toString(), "<!doctype html><p>Actual source</p>");
   assert.equal(calls.filter(call => call.url.includes("/artifact/demo")).length, 1);
@@ -1262,11 +1267,12 @@ test("Claude ZIP preserves unique names despite identical response filenames and
   const files = [
     { name: "same.html", url: "/one" }, { name: "same.html", url: "/two" },
     { name: "same (2).html", url: "/three" },
+    { name: "README.md", url: "/readme" },
     { name: "missing", error: "Artifact unavailable" }
   ];
   claude.applyUniqueDownloadNames(files);
   const out = await claude.downloadClaudeFilesToZip(files, "test.zip");
-  assert.equal(out.results.filter(result => result.ok).length, 3);
+  assert.equal(out.results.filter(result => result.ok).length, 4);
   const bytes = Buffer.from(await downloaded.arrayBuffer());
   const names = [];
   for (let offset = 0; bytes.readUInt32LE(offset) === 0x04034b50;) {
@@ -1276,7 +1282,7 @@ test("Claude ZIP preserves unique names despite identical response filenames and
     names.push(bytes.subarray(offset + 30, offset + 30 + length).toString());
     offset += 30 + length + extra + size;
   }
-  assert.deepEqual(names, ["same.html", "same (2).html", "same (2) (2).html", "export-failures.json"]);
+  assert.deepEqual(names, ["README.md", "same.html", "same (2).html", "same (2) (2).html", "README (2).md", "export-manifest.json", "export-failures.json"]);
   assert.match(bytes.toString(), /Artifact unavailable/);
 });
 
@@ -1304,7 +1310,7 @@ for (const provider of ["chatgpt", "claude"]) {
       const downloads = [];
       sandbox.downloadBlob = (blob, name) => downloads.push({ blob, name });
       sandbox.downloadJson = () => assert.fail("Combined export must not download separate JSON");
-      sandbox.console = { ...console, warn() {} };
+      sandbox.console = { log() {}, warn() {}, error() {}, table() {} };
       sandbox.fetch = async () => scenario === "failed"
         ? new Response("unavailable", { status: 404 }) : new Response("attachment bytes");
       let result;
@@ -1340,7 +1346,7 @@ for (const provider of ["chatgpt", "claude"]) {
       assert.equal(history.exportMode, "all-branches");
       assert.equal(history.branches.length, 2);
       if (scenario === "files") assert.equal(entries.get("files/conversation.json").toString(), "attachment bytes");
-      if (scenario === "empty") assert.equal(entries.size, 1);
+      if (scenario === "empty") assert.equal(entries.size, provider === "claude" ? 4 : 3);
       if (scenario === "failed") assert.match(entries.get("export-failures.json").toString(), /404/);
     });
   }
@@ -1364,4 +1370,184 @@ test("Combined ZIP button stays enabled with empty or unavailable file probes", 
       assert.equal(selectedMode, "conversation-and-files");
     }
   }
+});
+
+test('Claude receipts preserve delivery identity, branches and repeated associations', () => {
+  const c = loadClaudeExporter();
+  const ids = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
+  const data = {chat_messages:[claudeMessage('root','assistant',{content:[{type:'tool_use',name:'SendUserFile',id:'send',input:{files:['/tmp/r5.md','/tmp/eval-inputs.zip']}}]}),
+    claudeMessage('left','assistant',{parent_message_uuid:'root',content:[{type:'tool_result',tool_use_id:'send',content:`2 files delivered.\n/tmp/r5.md → file_uuid: ${ids[0]}\n/tmp/eval-inputs.zip → file_uuid: ${ids[1]}` }]}),
+    claudeMessage('right','assistant',{parent_message_uuid:'root',content:[{type:'tool_result',tool_use_id:'send',content:`/tmp/r5.md → file_uuid: ${ids[0]}`} ]})]};
+  const inventory = c.buildClaudeInventory(data,'conv','org');
+  assert.equal(inventory.files.length,2);
+  assert.equal(inventory.files[0].associations.length,2);
+  assert.notDeepEqual(inventory.files[0].associations[0].branchPath,inventory.files[0].associations[1].branchPath);
+  assert.equal(inventory.history.branches[0].messages[0].blocks[0].tool_use_id,'send');
+});
+
+test('Claude quickstart filtering is contextual and leaves real listed and explicit links', () => {
+  const c=loadClaudeExporter();
+  const catalogue='Quickstart. type_url: https://claude.ai/artifact/template\nFor a plain page, keep this guidance.';
+  const data={chat_messages:[claudeMessage('m','assistant',{content:[
+    {type:'tool_use',name:'Artifact',id:'q',input:{action:'quickstart'}},
+    {type:'tool_result',tool_use_id:'q',content:[{type:'text',text:catalogue}]},
+    {type:'tool_use',name:'Artifact',id:'l',input:{action:'list'}},
+    {type:'tool_result',tool_use_id:'l',content:'https://claude.ai/artifact/real'},
+    {type:'text',text:'https://claude.ai/artifact/template https://claude.ai/artifact/PENDING'}]})]};
+  const i=c.buildClaudeInventory(data,'conv','org');
+  assert.deepEqual(Array.from(i.artifacts,a=>a.slug),['real','template']);
+  assert.equal(i.artifacts[0].associations[0].relationship,'listed');
+  const blocks=i.history.messages[0].blocks;
+  assert.match(blocks[1].content[0].text,/omitted/);
+  assert.match(blocks[1].content[0].text,/keep this guidance/);
+  assert.match(blocks[4].text,/artifact\/template/);
+});
+
+test('Claude known workspace route survives failed listing and hashes exact ZIP bytes', async () => {
+  const c=loadClaudeExporter();let blob;
+  c.downloadBlob=b=>blob=b;
+  c.fetch=async url => String(url).includes('download-file') ? new Response('zip bytes') : new Response('',{status:404});
+  const data={uuid:'conv',chat_messages:[claudeMessage('m','user',{files:[{file_uuid:'f',file_kind:'blob',path:'/mnt/user-data/uploads/a.zip',size_bytes:9}]})]};
+  const out=await c.downloadClaudeConversationFiles(data,'conv','org',c.buildClaudeAllBranchesExport(data,'conv','org'));
+  assert.equal(out.counts.downloaded,1);assert.equal(out.counts.discoveryFailures,1);
+  const entries=await readStoredZip(blob), manifest=JSON.parse(entries.get('export-manifest.json'));
+  const row=manifest.candidates[0];
+  assert.deepEqual(row.routesAttempted.map(r=>r.route),['direct','workspace']);
+  assert.equal(row.sha256,require('node:crypto').createHash('sha256').update(entries.get(row.zipPath)).digest('hex'));
+  assert.equal(row.bytes,entries.get(row.zipPath).length);
+});
+
+test('Claude historical source uses matching tokens and keeps missing explicit versions', async () => {
+  const c=loadClaudeExporter(), id='11111111-1111-4111-8111-111111111111';
+  c.DOMParser=class {parseFromString(){return {documentElement:{dataset:{frameUuid:id,frameUchost:`${id}.frame.claudeusercontent.com`}}};}};
+  const versions=Array.from({length:5},(_,i)=>`179195819${i}-6272`);
+  c.fetch=async(url,init)=>{
+    url=String(url);
+    if(url.includes('/artifact/'))return new Response('shell');
+    if(url.includes('/versions/'))return Response.json({history:versions,versions:Object.fromEntries(versions.map(v=>[v,{label:v,thumb_img_url:`https://${id}.frame.claudeusercontent.com/_f/${v}/_thumb.img?__frame_t=${v}`}]))});
+    if(url.includes('/api/frame/')){assert.equal(init.headers['x-frame-cp'],'go');return Response.json({ver:versions[4],assetToken:versions[4],files:[{path:'index.html'}]});}
+    if(url.includes('/_files.json'))return Response.json([{path:'index.html'}]);
+    const parsed=new URL(url),version=parsed.pathname.split('/')[2];assert.equal(parsed.searchParams.get('__frame_t'),version);
+    return new Response(version);
+  };
+  const data={chat_messages:[claudeMessage('m','assistant',{content:[{type:'text',text:'https://claude.ai/artifact/page version 1791958199-6272'}]})]};
+  const inventory=c.buildClaudeInventory(data,'conv','org');await c.addClaudePublishedArtifactFiles(inventory.files,data,'org',inventory);
+  assert.equal(inventory.files.length,6);
+  for(const file of inventory.files.filter(f=>!f.error)){const entry=await c.fetchClaudeDownloadEntry(file);assert.equal(Buffer.concat(entry.parts.map(Buffer.from)).toString(),file.version);}
+  assert.match(inventory.files.find(f=>f.version==='1791958199-6272').error,/Historical/);
+});
+
+function copyHarness({returnedId,existing=[],ambiguous=false,downloadFailure=false,deleteFailure=false,journal={}}={}) {
+  const c=loadClaudeExporter();
+  const original='11111111-1111-4111-8111-111111111111',copy='22222222-2222-4222-8222-222222222222';
+  const events=[],stored=structuredClone(journal);
+  c.chrome={storage:{local:{get:async()=>structuredClone(stored),set:async v=>{events.push('journal');Object.assign(stored,structuredClone(v));}}}};
+  c.fetch=async(url,init={})=>{
+    url=String(url);
+    if(url.endsWith('/api/account'))return Response.json({uuid:'account'});
+    if(url.includes('/frames?'))return Response.json({frames:[{slug:original},...existing.map(slug=>({slug}))]});
+    if(init.method==='POST'){events.push('create');return ambiguous ? new Response('not json') : Response.json({slug:returnedId || copy,version:'copy-v',owned:true,owner_account_id:'account'});}
+    if(init.method==='DELETE'){events.push('delete');return new Response(null,{status:deleteFailure?403:204});}
+    if(url.includes('/_src/')){events.push('download');return new Response(downloadFailure?'missing':'source',{status:downloadFailure?404:200});}
+    if(url.includes(`/frame/${original}?`))return Response.json({ver:'original-v',duplicable:true});
+    if(url.includes(`/frame/${copy}?`))return Response.json({ver:'copy-v',viewer:{owner:true},perm:{role:'owner'},assetToken:'test',files:[{path:'index.html',size:6}]});
+    throw new Error(`Unexpected URL ${url}`);
+  };
+  const create=c.createZipAccumulator;
+  c.createZipAccumulator=()=>{const zip=create();return {...zip,addEntry:async entry=>{if(entry.name.includes('index.html'))events.push('zip');await zip.addEntry(entry);}};};
+  let blob;c.downloadBlob=b=>blob=b;
+  return {c,original,copy,events,stored,getBlob:()=>blob,file:{id:original,artifactId:original,version:'original-v',copyEligible:true,name:'shared',error:'No token',associations:[]}};
+}
+
+test('Claude copy lifecycle journals, downloads, inserts ZIP then deletes; hashes match',async()=>{
+  const h=copyHarness();const result=await h.c.downloadClaudeFilesToZip([h.file],'test.zip',null,[],'org');
+  assert.equal(result.results[0].ok,true);assert.deepEqual(h.events,['create','journal','journal','download','zip','delete','journal']);
+  const entries=await readStoredZip(h.getBlob()),manifest=JSON.parse(entries.get('export-manifest.json'));
+  const row=manifest.candidates[0];assert.equal(row.temporaryCopy.cleanup,'deleted');assert.equal(row.provenance,'exported-through-copy');
+  assert.equal(row.sha256,require('node:crypto').createHash('sha256').update(entries.get(row.zipPath)).digest('hex'));
+  assert.equal(JSON.stringify(h.stored).includes('assetToken'),false);
+});
+for(const failure of ['original','existing','wrong','ambiguous']) test(`Claude refuses deletion for ${failure} creation identity`,async()=>{
+  const original='11111111-1111-4111-8111-111111111111',copy='22222222-2222-4222-8222-222222222222';
+  const h=copyHarness({returnedId:failure==='original'?original:failure==='wrong'?'bad':copy,existing:failure==='existing'?[copy]:[],ambiguous:failure==='ambiguous'});
+  const manager=h.c.createClaudeCopyManager('org');await assert.rejects(manager.acquire(h.file));
+  await assert.rejects(manager.cleanup({copyId:copy}),/receipt/);
+  assert.equal(h.events.filter(e=>e==='create').length,1);assert.equal(h.events.includes('delete'),false);
+});
+test('Claude reused and previous-run receipts cannot authorize deletion',async()=>{
+  const original='11111111-1111-4111-8111-111111111111',copy='22222222-2222-4222-8222-222222222222';
+  const h=copyHarness({journal:{'claudeExportCopies:org:old':[{originalId:original,originalVersion:'original-v',copyId:copy,copyVersion:'copy-v',sourceVerified:true,cleanup:'pending'}]}});
+  const manager=h.c.createClaudeCopyManager('org'),receipt=await manager.acquire(h.file);assert.equal(receipt.reused,true);
+  await assert.rejects(manager.cleanup(receipt),/receipt/);assert.equal(h.events.length,0);
+  const fresh=copyHarness(),first=fresh.c.createClaudeCopyManager('org'),created=await first.acquire(fresh.file);
+  await assert.rejects(fresh.c.createClaudeCopyManager('org').cleanup(created),/receipt/);
+  await first.cleanup(created);await assert.rejects(first.cleanup(created),/receipt/);
+});
+test('Claude download failure cleans only the new copy and reports cleanup failure separately',async()=>{
+  const h=copyHarness({downloadFailure:true,deleteFailure:true});
+  const result=await h.c.downloadClaudeFilesToZip([h.file],'test.zip',null,[],'org');
+  assert.equal(result.results[0].ok,false);assert.equal(result.cleanupFailures.length,1);
+  assert.equal(h.events.includes('zip'),false);assert.equal(h.events.includes('delete'),true);
+  const entries=await readStoredZip(h.getBlob()),failures=JSON.parse(entries.get('export-failures.json'));
+  assert.deepEqual(failures.map(f=>f.kind),['download','cleanup']);assert.match(failures[1].copyUrl,/artifact\//);
+});
+
+test('Claude copies current source after access denial, but not after a network failure', async () => {
+  for (const denied of [true,false]) {
+    const h=copyHarness();const fetch=h.c.fetch;
+    h.c.fetch=async (url,init)=>{
+      if(url==='/original-source') { if(denied)return new Response(null,{status:403});throw new TypeError('Network error'); }
+      return fetch(url,init);
+    };
+    const file={...h.file, id:`${h.original}/original-v/index.html`, error:null, copyEligible:false,
+      copyCapable:true, sourcePath:'index.html', url:'/original-source'};
+    const result=await h.c.downloadClaudeFilesToZip([file],'test.zip',null,[],'org');
+    assert.equal(result.results[0].ok,denied);
+    assert.equal(h.events.includes('create'),denied);
+    assert.equal(h.events.includes('delete'),denied);
+  }
+});
+
+test('Both ZIP writers produce valid Deflate entries and retain stored fallback', async () => {
+  const zlib=require('node:zlib');
+  const original=Buffer.from('Unicode source: λ; repeated content.\n'.repeat(400));
+  for (const load of [loadClaudeExporter,loadChatGptExporter]) {
+    const c=load();c.CompressionStream=CompressionStream;c.Response=Response;
+    const blob=await c.createZipBlob([{name:'source.html',parts:[original]},{name:'nested.zip',parts:[original]}]);
+    const bytes=Buffer.from(await blob.arrayBuffer());let offset=0;
+    for (const method of [8,0]) {
+      assert.equal(bytes.readUInt32LE(offset),0x04034b50);
+      assert.equal(bytes.readUInt16LE(offset+8),method);
+      const packedSize=bytes.readUInt32LE(offset+18),size=bytes.readUInt32LE(offset+22);
+      const start=offset+30+bytes.readUInt16LE(offset+26)+bytes.readUInt16LE(offset+28);
+      const packed=bytes.subarray(start,start+packedSize),actual=method===8?zlib.inflateRawSync(packed):packed;
+      assert.deepEqual(actual,original);assert.equal(size,actual.length);
+      assert.equal(bytes.readUInt32LE(offset+14),c.crc32(new Uint8Array(actual)));
+      if(method===8)assert.ok(packedSize<size/2);
+      offset=start+packedSize;
+    }
+    assert.equal(bytes.readUInt32LE(offset),0x02014b50);
+    c.CompressionStream=class {constructor(){throw new Error('unavailable');}};
+    const fallback=Buffer.from(await(await c.createZipBlob([{name:'source.html',parts:[original]}])).arrayBuffer());
+    assert.equal(fallback.readUInt16LE(8),0);assert.equal(fallback.readUInt32LE(18),original.length);
+  }
+});
+
+test('Claude reports partial multi-file copies and ambiguous creation without hiding cleanup risk', async () => {
+  const h=copyHarness(),fetch=h.c.fetch;
+  h.c.fetch=async(url,init)=>{
+    if(String(url).includes('/_src/style.css')) return new Response(null,{status:404});
+    const response=await fetch(url,init);
+    if(String(url).includes(`/frame/${h.copy}?`) && !init?.method) {
+      const metadata=await response.json();metadata.files.push({path:'style.css',size:6});return Response.json(metadata);
+    }
+    return response;
+  };
+  const result=await h.c.downloadClaudeFilesToZip([h.file],'test.zip',null,[],'org');
+  assert.equal(result.results.length,2);assert.equal(result.results.filter(r=>r.ok).length,1);
+  assert.equal(result.cleanupFailures.length,0);assert.equal(h.events.includes('delete'),true);
+  const uncertain=copyHarness({ambiguous:true});
+  const outcome=await uncertain.c.downloadClaudeFilesToZip([uncertain.file],'test.zip',null,[],'org');
+  assert.equal(outcome.cleanupFailures[0].cleanup,'creation-unknown');
+  assert.equal(uncertain.events.includes('delete'),false);
 });

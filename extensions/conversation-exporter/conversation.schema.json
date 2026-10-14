@@ -1,0 +1,381 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Conversation export",
+  "description": "Segment tree: each node holds only its local messages. Read ancestors before a child branch.",
+  "$ref": "#/$defs/node",
+  "$defs": {
+    "counts": {
+      "type": "object",
+      "properties": {
+        "messages": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "user": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "assistant": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "branchPoints": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "leafBranches": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "messageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "messageIndex": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "branchPath": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "size": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "mime": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "required": [
+        "stage",
+        "files",
+        "artifacts",
+        "discoveryFailures"
+      ],
+      "properties": {
+        "stage": {
+          "const": "discovery"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "copyEligible": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "associations": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "discoveryFailures": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "block": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "thinking": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "tool_use_id": {
+          "type": "string"
+        },
+        "input": {},
+        "content": {},
+        "is_error": {
+          "type": "boolean"
+        }
+      }
+    },
+    "message": {
+      "type": "object",
+      "required": [
+        "index",
+        "id",
+        "role",
+        "text",
+        "files"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "enum": [
+            "user",
+            "assistant"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "create_time": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/block"
+          }
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "required": [
+        "exportedAt",
+        "source",
+        "exportMode",
+        "conversationId",
+        "messages",
+        "files"
+      ],
+      "properties": {
+        "exportedAt": {
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "claude-api",
+            "backend-api",
+            "claude-dom-fallback"
+          ]
+        },
+        "exportMode": {
+          "enum": [
+            "all-branches",
+            "current-branch"
+          ]
+        },
+        "branchStructure": {
+          "const": "segment-tree"
+        },
+        "url": {
+          "type": "string"
+        },
+        "conversationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "organizationId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "create_time": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ]
+        },
+        "update_time": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ]
+        },
+        "branchPath": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "branchIndex": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "branchLabel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recovery": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "counts": {
+          "$ref": "#/$defs/counts"
+        },
+        "localCounts": {
+          "$ref": "#/$defs/counts"
+        },
+        "totalCounts": {
+          "$ref": "#/$defs/counts"
+        },
+        "fileInventory": {
+          "$ref": "#/$defs/inventory"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/message"
+          }
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        },
+        "branches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/node"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "exportMode": {
+                "const": "all-branches"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "branchStructure",
+              "branchPath",
+              "branches",
+              "localCounts",
+              "totalCounts"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
